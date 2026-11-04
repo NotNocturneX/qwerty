@@ -61,12 +61,15 @@ local function tab(name, glyph, description)
 	return t
 end
 
-tab("Combat",   "C", "Hit aura, guard and potions")
-tab("Mobs",     "M", "Auto farm and its filters")
-tab("Mining",   "O", "Ore aura and auto-mine")
-tab("ESP",      "E", "Creature and player highlights")
-tab("Status",   "S", "Live counters and menu options")
-tab("Movement", "V", "Speed, jump and anti-AFK")
+tab("Combat",   "C", "Hit aura, guard, defence and potions")
+tab("Mobs",     "M", "Auto farm, filters and the farm zone")
+tab("Mining",   "O", "Ore aura, auto-mine and the forge")
+tab("ESP",      "E", "Creatures, players, chests and loot")
+tab("Visuals",  "L", "FOV, fog, rings and the path")
+tab("Movement", "V", "Speed, jump, noclip, travel")
+tab("PvP",      "P", "Player targeting, skills and guard")
+tab("Misc",     "X", "Anti-cheat and menu options")
+tab("Status",   "S", "Live counters")
 
 ----------------------------------------------------------------------
 -- control helpers
@@ -173,6 +176,33 @@ local function button(sec, text, callback, hint)
 	return ctrl
 end
 
+local function colorPicker(sec, flag, text, default, onChanged, hint)
+	if not sec then return nil end
+	local ctrl = sec:AddColorPicker({
+		Name    = text,
+		Flag    = flag,
+		Default = default,
+		Callback = function(c)
+			if onChanged then pcall(onChanged, c) end
+		end,
+	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
+end
+
+local function keybind(sec, flag, text, default, onChange, onPress, hint)
+	if not sec then return nil end
+	local ctrl = sec:AddKeybind({
+		Name      = text,
+		Default   = default,
+		OnChanged = onChange,
+		Callback  = onPress,
+	})
+	note(sec, hint)
+	return ctrl
+end
+
 -- AddLabel hands back a status line: :Set(text), :SetColor(c), :SetVisible(b).
 local function label(sec, text)
 	if not sec then return nil end
@@ -197,7 +227,7 @@ end
 ----------------------------------------------------------------------
 -- menu options that belong to the window rather than to a feature
 ----------------------------------------------------------------------
-local secMenu = section("Status", "MENU")
+local secMenu = section("Misc", "MENU")
 toggle(secMenu, "menu_watermark", "Watermark", false, function(v)
 	pcall(function() window:SetWatermark(v) end)
 end, "fps, ping and clock in one strip")
@@ -207,6 +237,15 @@ dropdown(secMenu, "menu_palette", "Palette",
 slider(secMenu, "menu_scale", "Menu scale", 60, 160, 100, 5, "%", function(v)
 	pcall(function() window:SetScale(v / 100) end)
 end)
+keybind(secMenu, "menu_key", "Menu key", Enum.KeyCode.F4, function(k)
+	if k then pcall(function() window:SetMenuKey(k) end) end
+end, nil, "F4 works here; Insert arrives as End/KeypadZero in this game")
+button(secMenu, "Open menu now", function()
+	pcall(function() window:Toggle(true) end)
+end)
+button(secMenu, "Copy JobID", function()
+	pcall(function() window:Copy(game.JobId, "JobId") end)
+end, "puts this server's JobId on the clipboard")
 button(secMenu, "Unload", function()
 	-- runs the same teardown a reload does, without needing one
 	pcall(SESSION.teardown)

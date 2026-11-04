@@ -3,7 +3,7 @@
 ----------------------------------------------------------------------
 -- Teardown must undo everything this run did and nothing else: connections
 -- dropped, engine properties handed back, our own instances destroyed, the
--- library unloaded. It runs on unload and again at the top of the next run, so
+-- window torn down. It runs on unload and again at the top of the next run, so
 -- a reload never stacks two menus or two sets of highlights.
 function SESSION.teardown()
 	if not SESSION.alive then return end
@@ -40,9 +40,10 @@ function SESSION.teardown()
 end
 
 table.insert(SESSION.restore, function()
-	-- guard cannot be left up after unload: the server keeps the input latched
-	if SESSION.Combat and SESSION.Combat.guardHeld and SESSION.setGuard then
-		pcall(SESSION.setGuard, false)
+	-- guard cannot be left up after unload: the server keeps the input latched,
+	-- and several owners can be holding it
+	if SESSION.setGuard then
+		pcall(SESSION.setGuard, false, "*")
 	end
 end)
 

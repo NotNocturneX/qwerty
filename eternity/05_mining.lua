@@ -15,8 +15,10 @@ local MINE = {
 	on       = false,
 	auto     = false,
 	range    = 8,
+	seek     = 320,
 	interval = 1,
 	ignoreTier = false,
+	types    = {},
 	last     = 0,
 	swings   = 0,
 	mined    = 0,
@@ -26,6 +28,7 @@ local MINE = {
 }
 
 local ORE_DEFS = nil
+local ORE_TYPES = {}
 
 -- MiningConfig.ORES is a ModuleScript with the real tier/hits table. Reading it
 -- beats hardcoding a copy that goes stale.
@@ -37,6 +40,9 @@ task.spawn(function()
 	local ok, cfg = pcall(require, node)
 	if ok and type(cfg) == "table" and type(cfg.ORES) == "table" then
 		ORE_DEFS = cfg.ORES
+		for kind in pairs(cfg.ORES) do
+			if type(kind) == "string" then ORE_TYPES[kind] = true end
+		end
 		if tonumber(cfg.REACH) then
 			MINE.range = math.max(cfg.REACH - 0.5, 3)
 		end
@@ -53,15 +59,17 @@ local function myTier()
 	return (c and tonumber(c:GetAttribute("MiningTier"))) or 1
 end
 
-local function oreNodes(maxDist, limit)
+local function oreNodes(maxDist, limit, filter)
 	local out = {}
 	local _, hrp = character()
 	if not hrp then return out end
 	local tier = myTier()
+	local useFilter = filter and next(filter) ~= nil
 	for _, n in ipairs(CollectionService:GetTagged("OreNode")) do
 		local oreType = tostring(n:GetAttribute("OreType") or n.Name)
 		local breakable = MINE.ignoreTier or oreTier(oreType) <= tier
-		if breakable and n.Parent and n:GetAttribute("MinedOut") ~= true and n:FindFirstChild("Ore") then
+		local wanted = not useFilter or filter[oreType]
+		if breakable and wanted and n.Parent and n:GetAttribute("MinedOut") ~= true and n:FindFirstChild("Ore") then
 			local centre = n:GetAttribute("OreCenter")
 			if typeof(centre) ~= "Vector3" then
 				local ore = n:FindFirstChild("Ore")
@@ -70,7 +78,10 @@ local function oreNodes(maxDist, limit)
 			end
 			if centre then
 				local flat = dist2d(centre, hrp.Position)
-				if flat <= maxDist then
+				-- the game's own gate is reach+1 flat AND |dy| <= 8; a node far
+				-- above or below is a swing that can never land
+				local dy = math.abs(centre.Y - hrp.Position.Y)
+				if flat <= maxDist and dy <= 8 then
 					out[#out + 1] = { node = n, dist = flat, pos = centre, ore = oreType }
 				end
 			end
@@ -82,6 +93,7 @@ local function oreNodes(maxDist, limit)
 	end
 	return out
 end
+SESSION.oreNodes = oreNodes
 
 ----------------------------------------------------------------------
 -- aura: swing at whatever is already in reach
@@ -96,7 +108,7 @@ every(0.15, function()
 		MINE.status = "pickaxe not drawn"
 		return
 	end
-	local t = oreNodes(MINE.range, 1)[1]
+	local t = oreNodes(MINE.range, 1, MINE.types)[1]
 	if not t then
 		MINE.status = "no ore in reach"
 		return
@@ -148,9 +160,14 @@ every(0.35, function()
 
 	if now() - MINE.lastSeek < 1 then return end
 	MINE.lastSeek = now()
-	local best = oreNodes(MINE.range * 40, 1)[1]
+	local best = oreNodes(MINE.seek, 1, MINE.types)[1]
 	if not best then
-		MINE.status = "no ore nearby"
+		local any = oreNodes(MINE.seek, 1, nil)[1]
+		if not any and not MINE.ignoreTier then
+			MINE.status = ("no ore your tier-%d pickaxe can break"):format(myTier())
+		else
+			MINE.status = "no matching ore in range"
+		end
 		return
 	end
 	MINE.target = best.node
@@ -172,8 +189,22 @@ slider(secMine, "mine_range", "Reach", 3, 20, MINE.range, 0.5, " studs", functio
 	"MiningConfig.REACH is 7.5, plus 1 stud of slack")
 slider(secMine, "mine_interval", "Swing every", 0.3, 3, MINE.interval, 0.1, " s", function(v) MINE.interval = v end,
 	"MiningConfig.SWING_TIME is 1 s")
+slider(secMine, "mine_seek", "Search range", 50, 2000, MINE.seek, 25, " studs", function(v) MINE.seek = math.floor(v) end,
+	"how far auto-mine looks for its next node")
 toggle(secMine, "mine_tier", "Ignore pickaxe tier", MINE.ignoreTier, function(v) MINE.ignoreTier = v end,
 	"show ore your pickaxe cannot break anyway")
+
+local oreDropdown = dropdown(secMine, "mine_types", "Ore filter", { "Any" }, "Any", function(v)
+	MINE.types = (v and v ~= "Any") and { [v] = true } or {}
+end, "only mine this ore; Any mines every type your tier allows")
+
+every(3, function()
+	if not oreDropdown or not oreDropdown.SetOptions then return end
+	local list = { "Any" }
+	for kind in pairs(ORE_TYPES) do list[#list + 1] = kind end
+	table.sort(list)
+	pcall(function() oreDropdown:SetOptions(list) end)
+end, "mine-types")
 
 local lblMine = label(secStat, "Mining: idle")
 local lblMineStats = label(secStat, "0 nodes · 0 swings")

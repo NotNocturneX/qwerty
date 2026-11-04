@@ -27,6 +27,8 @@ local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local CollectionService  = game:GetService("CollectionService")
 local PathfindingService = game:GetService("PathfindingService")
 local VirtualUser        = game:GetService("VirtualUser")
+local Lighting           = game:GetService("Lighting")
+local UserInputService   = game:GetService("UserInputService")
 
 local player  = Players.LocalPlayer
 local remotes = ReplicatedStorage:WaitForChild("Remotes")

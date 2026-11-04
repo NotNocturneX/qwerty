@@ -20,12 +20,19 @@ must not change. `build.sh` concatenates them in that order into `eternity.lua`.
 | `00_core.lua` | Re-execution guard, services, visual tagging and orphan sweep, one scheduler, character cache |
 | `01_ui.lua` | Menu library load (`UI/Utils.lua`), window (F4), tabs, control helpers that write into plain config tables |
 | `02_walker.lua` | `walkTo` / `walkFollow` / `walkStop`, pathfinding with wide agent radii, per-frame `Humanoid:Move` steering |
-| `03_combat.lua` | Hit aura (Swing/Hit pair), guard duty cycle, potions, auto-farm targeting |
-| `04_esp.lua` | Pooled highlights with diffing (creatures + players) |
-| `05_mining.lua` | Ore discovery from the `OreNode` tag, tier gate, mining aura, auto-mine walker |
-| `06_movement.lua` | Hands-off-by-default speed/jump, infinite jump, anti-AFK |
+| `03_combat.lua` | Hit aura (Swing/Hit pair), hit-all, no-cooldown, unsheathe, guard duty cycle with retreat and timed resume, potions, auto respawn, infinite stamina, auto-farm targeting with filters |
+| `04_esp.lua` | Pooled highlight diffing (creatures + players) plus billboard chest/loot labels |
+| `05_mining.lua` | Ore discovery from the `OreNode` tag, tier gate, ore filter, mining aura, auto-mine walker |
+| `06_movement.lua` | Hands-off-by-default speed/jump, infinite jump, noclip, auto-hop restore, anti-AFK |
 | `07_hud.lua` | Status labels and the once-a-second counter refresh |
-| `08_lifecycle.lua` | Teardown (connections, restores, instances, library) and startup |
+| `08_zone.lua` | Farm zone: place/clear, radius, stay-inside walking, kill-all, ring colour |
+| `09_visuals.lua` | FOV, fullbright, fog, kill/mining/zone rings, path dots |
+| `10_defense.lua` | `CombatPlus.onTelegraph` hook: auto parry, dodge AoE, dash through unparryable hits, danger zones |
+| `11_travel.lua` | Discovered landmarks, potion merchants, walk to nearest mob, stop key |
+| `12_pvp.lua` | PvPRules-gated player targeting, swing override, loadout skills, guard/parry, ability hook |
+| `13_blacksmith.lua` | `BlacksmithCraft` loop with material counting, craft limit and the server's own refusal message |
+| `14_anticheat.lua` | Adonis client neutralisation through the `Detected` closure's NetworkClient upvalue |
+| `20_lifecycle.lua` | Teardown (connections, restores, instances, window) and startup; must load last |
 
 ## Design notes
 
@@ -51,8 +58,17 @@ must not change. `build.sh` concatenates them in that order into `eternity.lua`.
 ./build.sh path/to/custom_out.lua   # custom path
 ```
 
-## Not ported yet
+## Ported from the legacy file
 
-PvP (rules module, parry timing), blacksmith, quest trail/ESP, info box, menu
-theming/rainbow, place names, world ESP (chests). Those sections exist in the
-legacy file and can be added one module at a time.
+Everything the old menu had, rebuilt rather than copied: hit-all and
+no-cooldown aura modes, auto-unsheathe, reach ring, manual swing, guard retreat
+and timed resume, infinite stamina, auto respawn, farm travel delay / skip-strong
+/ best-XP / sprint / mob filter, farm zone, mining search range and ore filter,
+auto blacksmith, chest and loot ESP, visual FOV / fog / brightness / rings /
+path, noclip, auto-hop restore, travel to landmarks and merchants, the whole PvP
+tab (rules-gated targeting, skills, guard/parry) and the Adonis patch.
+
+Still absent, deliberately: the old Neverlose-only chrome (watermark blocks,
+indicator badges) because the current library draws its own, and quest trail
+rendering, which the legacy file never actually implemented — its README listed
+it as unported too.

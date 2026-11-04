@@ -19,14 +19,58 @@ local MOVE = {
 	infJump  = false,
 	antiAfk  = true,
 	handsOff = true,
+	noclip   = false,
+	noAutoJump = false,
+	jumpWas  = nil,
+	jumpUseWas = nil,
 }
 
 local boundJumps = setmetatable({}, { __mode = "k" })
 
+----------------------------------------------------------------------
+-- collision (noclip), remembered per part
+----------------------------------------------------------------------
+local savedCollide = setmetatable({}, { __mode = "k" })
+
+local function setNoclip(on)
+	local c = character()
+	if not c then return end
+	for _, part in ipairs(c:GetDescendants()) do
+		if part:IsA("BasePart") then
+			if on then
+				if savedCollide[part] == nil then
+					savedCollide[part] = part.CanCollide
+				end
+				part.CanCollide = false
+			elseif savedCollide[part] ~= nil then
+				part.CanCollide = savedCollide[part]
+				savedCollide[part] = nil
+			end
+		end
+	end
+end
+MOVE.setNoclip = setNoclip
+table.insert(SESSION.restore, function() pcall(setNoclip, false) end)
+
+----------------------------------------------------------------------
+-- speed / jump
+----------------------------------------------------------------------
 every(0.4, function()
 	if not SESSION.alive then return end
 	local c, _, hum = character()
 	if not hum then return end
+
+	-- Collision and AutoJump are not "movement buffs": they are an engine state
+	-- the game sets for you. They stay available under hands-off, which is about
+	-- not rewriting WalkSpeed and JumpPower.
+	if MOVE.noclip then setNoclip(true) end
+	if MOVE.noAutoJump then
+		if MOVE.autoJumpWas == nil then MOVE.autoJumpWas = hum.AutoJumpEnabled end
+		hum.AutoJumpEnabled = false
+	elseif MOVE.autoJumpWas ~= nil then
+		hum.AutoJumpEnabled = MOVE.autoJumpWas
+		MOVE.autoJumpWas = nil
+	end
 
 	if MOVE.handsOff then
 		if MOVE.speedTouched then
@@ -45,9 +89,16 @@ every(0.4, function()
 		return
 	end
 
+	-- Each switch hands its property back when it is turned off. Without the
+	-- else branches, turning "Walk speed" off left the character at 24 until
+	-- hands-off was toggled, because only that path restored the value.
 	if MOVE.speedOn then
 		hum.WalkSpeed = MOVE.speed
 		MOVE.speedTouched = true
+	elseif MOVE.speedTouched then
+		MOVE.speedTouched = nil
+		local base = tonumber(c and c:GetAttribute("BaseWalkSpeed")) or 16
+		pcall(function() hum.WalkSpeed = base end)
 	end
 	if MOVE.jumpOn then
 		if MOVE.jumpWas == nil then
@@ -57,6 +108,12 @@ every(0.4, function()
 		hum.UseJumpPower = true
 		hum.JumpPower = MOVE.jump
 		MOVE.jumpTouched = true
+	elseif MOVE.jumpTouched then
+		MOVE.jumpTouched = nil
+		local was, useWas = MOVE.jumpWas, MOVE.jumpUseWas
+		MOVE.jumpWas, MOVE.jumpUseWas = nil, nil
+		if was then pcall(function() hum.JumpPower = was end) end
+		if useWas ~= nil then pcall(function() hum.UseJumpPower = useWas end) end
 	end
 end, "movement-apply")
 
@@ -115,6 +172,16 @@ toggle(secMove, "move_jump", "Jump power", MOVE.jumpOn, function(v) MOVE.jumpOn 
 slider(secMove, "move_jump_value", "Jump", 50, 300, MOVE.jump, 5, nil, function(v) MOVE.jump = v end)
 toggle(secMove, "move_infjump", "Infinite jump", MOVE.infJump, function(v) MOVE.infJump = v end,
 	"re-jumps on Freefall; one handler per humanoid")
+toggle(secMove, "noclip", "Noclip", MOVE.noclip, function(v)
+	MOVE.noclip = v
+	if not v then setNoclip(false) end
+end, "client-side collision only; each part is put back to what it was")
+toggle(secMove, "no_autojump", "Stop auto-hopping", MOVE.noAutoJump, function(v)
+	local _, _, hum = character()
+	if v and hum and MOVE.autoJumpWas == nil then MOVE.autoJumpWas = hum.AutoJumpEnabled end
+	MOVE.noAutoJump = v
+	if not v then MOVE.autoJumpWas = nil end
+end, "AutoJump hops you at every ledge and wall; your original setting is restored")
 
 toggle(secQol, "misc_antiafk", "Anti-AFK", MOVE.antiAfk, function(v) MOVE.antiAfk = v end)
 
