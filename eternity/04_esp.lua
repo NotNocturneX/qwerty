@@ -22,9 +22,14 @@ local POOL_MAX      = 28
 local PLAYER_POOL   = 12
 local pool          = {}
 local playerPool    = {}
-local shown         = setmetatable({}, { __mode = "k" })
-local shownPlayers  = setmetatable({}, { __mode = "k" })
+-- Strong keys on purpose. With weak keys a destroyed model is collected without
+-- its highlight record ever being marked free, so the pool silently fills with
+-- entries nobody can reuse and ESP stops drawing. A dead model is dropped on
+-- the next tick anyway, because the diff checks model.Parent.
+local shown         = {}
+local shownPlayers  = {}
 local lastColour    = nil
+local lastPlayerColour = nil
 
 local function makeHighlight(adornee)
 	local hl = Instance.new("Highlight")
@@ -142,16 +147,22 @@ every(0.4, function()
 			shownPlayers[model] = nil
 		end
 	end
+	local recolour = ESP.playerColour ~= lastPlayerColour
 	for model in pairs(want) do
-		if not shownPlayers[model] then
-			local rec = acquire(playerPool, model, PLAYER_POOL)
+		local rec = shownPlayers[model]
+		if not rec then
+			rec = acquire(playerPool, model, PLAYER_POOL)
 			if rec then
 				rec.obj.FillColor = ESP.playerColour
 				rec.obj.OutlineColor = ESP.playerColour
 				shownPlayers[model] = rec
 			end
+		elseif recolour then
+			rec.obj.FillColor = ESP.playerColour
+			rec.obj.OutlineColor = ESP.playerColour
 		end
 	end
+	lastPlayerColour = ESP.playerColour
 end, "esp-players")
 
 ----------------------------------------------------------------------

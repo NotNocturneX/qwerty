@@ -169,16 +169,23 @@ every(0.05, function()
 	local c, hrp, hum = character()
 	if not (c and hrp and hum and hum.Health > 0) then return end
 
-	-- survival before offence: guard while hurt, and never swing into guard
+	-- survival before offence: guard while hurt, and never swing into guard.
+	-- The setGuard(true) on EVERY path while held is what keeps Block alive: the
+	-- server drops a held input whose re-ping stops arriving, so returning early
+	-- between the two thresholds silently lost the guard.
 	local pct = healthPct()
-	if CFG.guard and pct then
-		if pct <= CFG.guardPct then
+	if CFG.guard and pct ~= nil then
+		if ST.guardHeld then
+			if pct >= CFG.resumePct then
+				setGuard(false)
+			else
+				setGuard(true)
+				ST.status = ("guarding (%d%%)"):format(math.floor(pct))
+				return
+			end
+		elseif pct <= CFG.guardPct then
 			setGuard(true)
 			ST.status = ("guarding (%d%%)"):format(math.floor(pct))
-			return
-		elseif ST.guardHeld and pct >= CFG.resumePct then
-			setGuard(false)
-		elseif ST.guardHeld then
 			return
 		end
 	end
@@ -201,17 +208,14 @@ every(0.05, function()
 end, "combat-aura")
 
 every(0.25, function()
-	if not (SESSION.alive and CFG.guard and CFG.aura) then
-		if ST.guardHeld then setGuard(false) end
-		return
+	-- release only: keeping it up is the aura's job, so there is exactly one
+	-- place that pings and one place that lets go
+	local wantGuard = SESSION.alive and CFG.aura and CFG.guard
+	local _, _, hum = character()
+	if ST.guardHeld and (not wantGuard or not hum or hum.Health <= 0) then
+		setGuard(false)
 	end
-	if ST.guardHeld and not CFG.guard then setGuard(false) end
-	if ST.guardHeld then
-		-- keep the held input alive while the aura is idle
-		local _, _, hum = character()
-		if not hum or hum.Health <= 0 then setGuard(false) end
-	end
-end, "combat-guard-keep")
+end, "combat-guard-release")
 
 ----------------------------------------------------------------------
 -- potions

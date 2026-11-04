@@ -73,7 +73,12 @@ local function groundPoint(pos)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	local mobsFolder = workspace:FindFirstChild("Mobs")
-	params.FilterDescendantsInstances = mobsFolder and { c, mobsFolder } or { c }
+	-- built explicitly: { c, mobsFolder } with c nil leaves a hole in the array,
+	-- which RaycastParams does not accept
+	local filter = {}
+	if c then filter[#filter + 1] = c end
+	if mobsFolder then filter[#filter + 1] = mobsFolder end
+	params.FilterDescendantsInstances = filter
 	local hit = workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -400, 0), params)
 	return hit and hit.Position or pos
 end

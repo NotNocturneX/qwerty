@@ -31,15 +31,10 @@ function SESSION.teardown()
 	end
 	SESSION.vis = {}
 
-	pcall(function()
-		if type(Library) == "table" and type(Library.Unload) == "function" then
-			Library:Unload()
-		end
-	end)
-	pcall(function()
-		local gui = Library and (Library.ScreenGui or Library.Gui)
-		if gui and gui.Parent then gui:Destroy() end
-	end)
+	-- the library owns its ScreenGui and every connection behind it
+	if SESSION.window and type(SESSION.window.Destroy) == "function" then
+		pcall(function() SESSION.window:Destroy() end)
+	end
 
 	if genv and genv.PE == SESSION then genv.PE = nil end
 end
@@ -51,5 +46,6 @@ table.insert(SESSION.restore, function()
 	end
 end)
 
+syncFlags()   -- a loaded config restores values without firing callbacks
 startScheduler()
 notify("Loaded · F4 opens the menu", "Eternity " .. SESSION.build, 5)

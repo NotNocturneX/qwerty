@@ -1,126 +1,213 @@
 ----------------------------------------------------------------------
--- UI — Raven, and nothing else
+-- UI — the project's own menu library (UI/Utils.lua)
 ----------------------------------------------------------------------
--- The original wrapped Raven in a 560-line Neverlose-shaped shim so ~290 call
--- sites could stay untouched. This fork has no legacy call sites, so it talks to
--- Raven directly and the shim is gone.
-local RAVEN_URL = "https://raw.githubusercontent.com/ImLiwo/ui-repo/main/raven/Library.lua"
+-- Raven is gone. This is the library from Enthusiasticzz/Autofarm-Script-Sbor,
+-- fetched exactly the way its Init.lua fetches it: two attempts, because
+-- game:HttpGet blocks the client and a dropped request is common, and an
+-- getgenv().AICBaseURL override so a fork or a pinned build works here too.
+local BRANCH = "main"
 
-local okLib, Library = pcall(function()
-	-- a local copy wins while editing the library itself
-	if type(isfile) == "function" and isfile("Raven/Library.lua") then
-		return loadstring(readfile("Raven/Library.lua"))()
+local function uiBase()
+	local env = type(getgenv) == "function" and getgenv() or nil
+	local override = env and env.AICBaseURL
+	if type(override) == "string" and override ~= "" then
+		return override:sub(-1) == "/" and override or (override .. "/")
 	end
-	return loadstring(game:HttpGet(RAVEN_URL))()
-end)
-if not okLib or type(Library) ~= "table" then
-	-- top-level return: with no library there is no menu, so stop here instead
-	-- of running every feature behind an invisible UI.
-	return warn("[PE] Raven failed to load: " .. tostring(Library))
+	return "https://raw.githubusercontent.com/Enthusiasticzz/Autofarm-Script-Sbor/refs/heads/"
+		.. BRANCH .. "/script/"
 end
 
--- F4, not Insert. Measured in this game: Insert arrives at Roblox as "End" or
--- "KeypadZero" and never matches the bound name, so the menu could not be
--- opened by keyboard at all. F4 arrives as "F4" and toggles cleanly.
-local window = Library:CreateWindow({
-	Title        = "Eternity",
-	Suffix       = SESSION.build,
-	Logo         = "shield",
-	Keybind      = "F4",
-	ConfigFolder = "Eternity",
-	Size         = Vector2.new(880, 560),
+local function uiFetch(path)
+	local url = uiBase() .. path
+	local reason
+	for _ = 1, 2 do
+		local ok, body = pcall(function() return game:HttpGet(url, true) end)
+		if ok and type(body) == "string" and body ~= "" then return body end
+		reason = body
+	end
+	error(("could not download %s: %s"):format(url, tostring(reason)))
+end
+
+local okLib, Library = pcall(function()
+	return loadstring(uiFetch("UI/Utils.lua"), "@UI/Utils.lua")()
+end)
+if not okLib or type(Library) ~= "table" then
+	-- top-level return: with no library there is no menu, so stop here rather
+	-- than running every feature behind an invisible UI.
+	return warn("[PE] menu library failed to load: " .. tostring(Library))
+end
+
+local window = Library.new({
+	Title       = "Eternity",
+	User        = { Name = "Eternity", Tag = SESSION.build },
+	StatusPerRow = 4,
 })
+
+-- Insert is not usable in this game: it reaches Roblox as "End" or
+-- "KeypadZero" and never matches the bound key. F4 was confirmed to arrive as
+-- "F4" and toggle, and nothing in this game binds it.
+pcall(function() window:SetMenuKey(Enum.KeyCode.F4) end)
 
 SESSION.Library = Library
 SESSION.window  = window
-SESSION.gui     = Library.ScreenGui or Library.Gui
 
+----------------------------------------------------------------------
+-- tabs
+----------------------------------------------------------------------
 local TABS = {}
-local function tab(name, icon)
-	local t = window:AddTab({ Name = name, Icon = icon })
+local function tab(name, glyph, description)
+	local t = window:AddTab({ Name = name, Glyph = glyph, Description = description })
 	TABS[name] = t
 	return t
 end
 
-local T = {
-	Combat   = tab("Combat",   "crosshair"),
-	Mobs     = tab("Mobs",     "rabbit"),
-	Mining   = tab("Mining",   "pickaxe"),
-	ESP      = tab("ESP",      "eye"),
-	Status   = tab("Status",   "activity"),
-	Movement = tab("Movement", "mouse-pointer-2"),
-}
+tab("Combat",   "C", "Hit aura, guard and potions")
+tab("Mobs",     "M", "Auto farm and its filters")
+tab("Mining",   "O", "Ore aura and auto-mine")
+tab("ESP",      "E", "Creature and player highlights")
+tab("Status",   "S", "Live counters and menu options")
+tab("Movement", "V", "Speed, jump and anti-AFK")
 
 ----------------------------------------------------------------------
 -- control helpers
 ----------------------------------------------------------------------
--- Every callback writes into a plain Lua table that the feature reads each
--- tick. Nothing at runtime looks a control up in Library.Options, so a control
--- that fails to build costs one missing row instead of a nil index twenty times
--- a second inside a pcall that would have hidden it.
-local function section(tabName, name, side)
-	local t = T[tabName]
+-- The feature modules call these with a flag and a label, and the flag becomes
+-- the library's Flag (so the value persists in its config). Every callback
+-- writes into a plain Lua table the tick reads; nothing at runtime looks a
+-- control up in library state.
+local function section(tabName, title, side)
+	local t = TABS[tabName]
 	if not t then return nil end
-	return t:AddSection({ Name = name, Side = side or "Left" })
+	return t:AddSection({ Title = title, Side = side or "Left" })
 end
 
-local function toggle(sec, flag, text, default, onChanged, tooltip)
+-- A note attaches to the control above it as extra hover text.
+local function note(sec, text)
+	if sec and text then pcall(function() sec:AddNote(tostring(text)) end) end
+end
+
+-- Saved configs restore control VALUES without firing callbacks — the library
+-- only calls back for user interaction. Without this the menu would show a
+-- loaded setting while the feature ran on its default.
+local APPLY = {}
+
+local function remember(flag, apply)
+	if flag and apply then APPLY[flag] = apply end
+end
+
+local function syncFlags()
+	local flags = (window and window.Flags) or (Library and Library.Flags)
+	if type(flags) ~= "table" then return end
+	for flag, apply in pairs(APPLY) do
+		local v = flags[flag]
+		if v ~= nil then pcall(apply, v) end
+	end
+end
+
+local function toggle(sec, flag, text, default, onChanged, hint)
 	if not sec then return nil end
-	return sec:AddToggle(flag, {
-		Text    = text,
+	local ctrl = sec:AddToggle({
+		Name    = text,
+		Flag    = flag,
 		Default = default and true or false,
-		Tooltip = tooltip,
-		Callback = function(state)
-			if onChanged then pcall(onChanged, state and true or false) end
+		Callback = function(v)
+			if onChanged then pcall(onChanged, v and true or false) end
 		end,
 	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
 end
 
-local function slider(sec, flag, text, min, max, default, step, suffix, onChanged, tooltip)
+-- The library formats the value with `Decimals` but derives nothing from Step,
+-- so a 0.05 step declared as Decimals 0 drew 0.6 as "( 1 s )" and 0.3 as
+-- "( 0 s )". Read the precision back out of the step instead of guessing.
+local function stepDecimals(step)
+	if not step then return 0 end
+	local s = tostring(step)
+	local dot = s:find(".", 1, true)
+	return dot and (#s - dot) or 0
+end
+
+local function slider(sec, flag, text, min, max, default, step, suffix, onChanged, hint)
 	if not sec then return nil end
-	return sec:AddSlider(flag, {
-		Text      = text,
-		Min       = min,
-		Max       = max,
-		Default   = default,
-		Increment = step or 1,
-		Suffix    = suffix,
-		Tooltip   = tooltip,
-		Callback  = function(v)
+	local stepSize = step or 1
+	local ctrl = sec:AddSlider({
+		Name     = text,
+		Flag     = flag,
+		Min      = min,
+		Max      = max,
+		Default  = default,
+		Step     = stepSize,
+		Decimals = stepDecimals(stepSize),
+		Suffix   = suffix,
+		Callback = function(v)
 			if onChanged then pcall(onChanged, tonumber(v) or default) end
 		end,
 	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
 end
 
-local function dropdown(sec, flag, text, values, default, onChanged, tooltip)
+local function dropdown(sec, flag, text, options, default, onChanged, hint)
 	if not sec then return nil end
-	return sec:AddDropdown(flag, {
-		Text    = text,
-		Values  = values,
+	local ctrl = sec:AddDropdown({
+		Name    = text,
+		Flag    = flag,
+		Options = options,
 		Default = default,
-		Tooltip = tooltip,
 		Callback = function(v)
 			if onChanged then pcall(onChanged, v) end
 		end,
 	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
 end
 
-local function button(sec, text, callback, tooltip)
+local function button(sec, text, callback, hint)
 	if not sec then return nil end
-	return sec:AddButton({ Text = text, Callback = callback, Tooltip = tooltip })
+	local ctrl = sec:AddButton({ Name = text, Callback = callback })
+	note(sec, hint)
+	return ctrl
 end
 
+-- AddLabel hands back a status line: :Set(text), :SetColor(c), :SetVisible(b).
 local function label(sec, text)
 	if not sec then return nil end
-	return sec:AddLabel({ Text = tostring(text or "") })
+	return sec:AddLabel(tostring(text or ""))
 end
 
 local function setText(ctrl, text)
-	if ctrl then pcall(function() ctrl:SetText(tostring(text)) end) end
+	if not ctrl then return end
+	if type(ctrl.Set) == "function" then
+		pcall(function() ctrl:Set(tostring(text)) end)
+	elseif type(ctrl.SetText) == "function" then
+		pcall(function() ctrl:SetText(tostring(text)) end)
+	end
 end
 
 local function notify(text, title, dur)
 	pcall(function()
-		Library:Notify({ Title = title or "Eternity", Content = tostring(text), Duration = tonumber(dur) or 4 })
+		window:Notify({ Title = title or "Eternity", Text = tostring(text), Duration = tonumber(dur) or 4 })
 	end)
 end
+
+----------------------------------------------------------------------
+-- menu options that belong to the window rather than to a feature
+----------------------------------------------------------------------
+local secMenu = section("Status", "MENU")
+toggle(secMenu, "menu_watermark", "Watermark", false, function(v)
+	pcall(function() window:SetWatermark(v) end)
+end, "fps, ping and clock in one strip")
+dropdown(secMenu, "menu_palette", "Palette",
+	{ "Default", "Navy", "Midnight", "Rose", "Forest", "Light" }, "Default",
+	function(v) pcall(function() window:SetPalette(v) end) end)
+slider(secMenu, "menu_scale", "Menu scale", 60, 160, 100, 5, "%", function(v)
+	pcall(function() window:SetScale(v / 100) end)
+end)
+button(secMenu, "Unload", function()
+	-- runs the same teardown a reload does, without needing one
+	pcall(SESSION.teardown)
+end, "disconnect everything and close the menu")

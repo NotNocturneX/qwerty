@@ -1,6 +1,6 @@
 -- Project Eternity — fork
 -- Place 108438460215241 (Sword Art: Eternity, MOTE Games), placeVersion 1045.
--- Executor: Real · UI: Raven
+-- Executor: Real · UI: UI/Utils.lua (Autofarm-Script-Sbor)
 --
 -- This is one Lua chunk split across numbered files. A local declared in a lower
 -- number is visible to every file above it, so the numeric order IS the load
@@ -110,9 +110,13 @@ local CH = { char = nil, hrp = nil, hum = nil }
 
 local function resolveCharacter()
 	local c = player.Character
-	if c == CH.char then return CH.char, CH.hrp, CH.hum end
-	CH.char, CH.hrp, CH.hum = c, nil, nil
-	if c then
+	if c ~= CH.char then
+		CH.char, CH.hrp, CH.hum = c, nil, nil
+	end
+	-- CharacterAdded fires before the body is assembled, so a cache filled only
+	-- on that event can hold nil for the rest of the character's life. Re-resolve
+	-- while either part is missing or has been removed.
+	if c and (not CH.hrp or not CH.hrp.Parent or not CH.hum or not CH.hum.Parent) then
 		CH.hrp = c:FindFirstChild("HumanoidRootPart")
 		CH.hum = c:FindFirstChildOfClass("Humanoid")
 	end
@@ -142,131 +146,218 @@ local function now()
 	return os.clock()
 end
 ----------------------------------------------------------------------
--- UI — Raven, and nothing else
+-- UI — the project's own menu library (UI/Utils.lua)
 ----------------------------------------------------------------------
--- The original wrapped Raven in a 560-line Neverlose-shaped shim so ~290 call
--- sites could stay untouched. This fork has no legacy call sites, so it talks to
--- Raven directly and the shim is gone.
-local RAVEN_URL = "https://raw.githubusercontent.com/ImLiwo/ui-repo/main/raven/Library.lua"
+-- Raven is gone. This is the library from Enthusiasticzz/Autofarm-Script-Sbor,
+-- fetched exactly the way its Init.lua fetches it: two attempts, because
+-- game:HttpGet blocks the client and a dropped request is common, and an
+-- getgenv().AICBaseURL override so a fork or a pinned build works here too.
+local BRANCH = "main"
 
-local okLib, Library = pcall(function()
-	-- a local copy wins while editing the library itself
-	if type(isfile) == "function" and isfile("Raven/Library.lua") then
-		return loadstring(readfile("Raven/Library.lua"))()
+local function uiBase()
+	local env = type(getgenv) == "function" and getgenv() or nil
+	local override = env and env.AICBaseURL
+	if type(override) == "string" and override ~= "" then
+		return override:sub(-1) == "/" and override or (override .. "/")
 	end
-	return loadstring(game:HttpGet(RAVEN_URL))()
-end)
-if not okLib or type(Library) ~= "table" then
-	-- top-level return: with no library there is no menu, so stop here instead
-	-- of running every feature behind an invisible UI.
-	return warn("[PE] Raven failed to load: " .. tostring(Library))
+	return "https://raw.githubusercontent.com/Enthusiasticzz/Autofarm-Script-Sbor/refs/heads/"
+		.. BRANCH .. "/script/"
 end
 
--- F4, not Insert. Measured in this game: Insert arrives at Roblox as "End" or
--- "KeypadZero" and never matches the bound name, so the menu could not be
--- opened by keyboard at all. F4 arrives as "F4" and toggles cleanly.
-local window = Library:CreateWindow({
-	Title        = "Eternity",
-	Suffix       = SESSION.build,
-	Logo         = "shield",
-	Keybind      = "F4",
-	ConfigFolder = "Eternity",
-	Size         = Vector2.new(880, 560),
+local function uiFetch(path)
+	local url = uiBase() .. path
+	local reason
+	for _ = 1, 2 do
+		local ok, body = pcall(function() return game:HttpGet(url, true) end)
+		if ok and type(body) == "string" and body ~= "" then return body end
+		reason = body
+	end
+	error(("could not download %s: %s"):format(url, tostring(reason)))
+end
+
+local okLib, Library = pcall(function()
+	return loadstring(uiFetch("UI/Utils.lua"), "@UI/Utils.lua")()
+end)
+if not okLib or type(Library) ~= "table" then
+	-- top-level return: with no library there is no menu, so stop here rather
+	-- than running every feature behind an invisible UI.
+	return warn("[PE] menu library failed to load: " .. tostring(Library))
+end
+
+local window = Library.new({
+	Title       = "Eternity",
+	User        = { Name = "Eternity", Tag = SESSION.build },
+	StatusPerRow = 4,
 })
+
+-- Insert is not usable in this game: it reaches Roblox as "End" or
+-- "KeypadZero" and never matches the bound key. F4 was confirmed to arrive as
+-- "F4" and toggle, and nothing in this game binds it.
+pcall(function() window:SetMenuKey(Enum.KeyCode.F4) end)
 
 SESSION.Library = Library
 SESSION.window  = window
-SESSION.gui     = Library.ScreenGui or Library.Gui
 
+----------------------------------------------------------------------
+-- tabs
+----------------------------------------------------------------------
 local TABS = {}
-local function tab(name, icon)
-	local t = window:AddTab({ Name = name, Icon = icon })
+local function tab(name, glyph, description)
+	local t = window:AddTab({ Name = name, Glyph = glyph, Description = description })
 	TABS[name] = t
 	return t
 end
 
-local T = {
-	Combat   = tab("Combat",   "crosshair"),
-	Mobs     = tab("Mobs",     "rabbit"),
-	Mining   = tab("Mining",   "pickaxe"),
-	ESP      = tab("ESP",      "eye"),
-	Status   = tab("Status",   "activity"),
-	Movement = tab("Movement", "mouse-pointer-2"),
-}
+tab("Combat",   "C", "Hit aura, guard and potions")
+tab("Mobs",     "M", "Auto farm and its filters")
+tab("Mining",   "O", "Ore aura and auto-mine")
+tab("ESP",      "E", "Creature and player highlights")
+tab("Status",   "S", "Live counters and menu options")
+tab("Movement", "V", "Speed, jump and anti-AFK")
 
 ----------------------------------------------------------------------
 -- control helpers
 ----------------------------------------------------------------------
--- Every callback writes into a plain Lua table that the feature reads each
--- tick. Nothing at runtime looks a control up in Library.Options, so a control
--- that fails to build costs one missing row instead of a nil index twenty times
--- a second inside a pcall that would have hidden it.
-local function section(tabName, name, side)
-	local t = T[tabName]
+-- The feature modules call these with a flag and a label, and the flag becomes
+-- the library's Flag (so the value persists in its config). Every callback
+-- writes into a plain Lua table the tick reads; nothing at runtime looks a
+-- control up in library state.
+local function section(tabName, title, side)
+	local t = TABS[tabName]
 	if not t then return nil end
-	return t:AddSection({ Name = name, Side = side or "Left" })
+	return t:AddSection({ Title = title, Side = side or "Left" })
 end
 
-local function toggle(sec, flag, text, default, onChanged, tooltip)
+-- A note attaches to the control above it as extra hover text.
+local function note(sec, text)
+	if sec and text then pcall(function() sec:AddNote(tostring(text)) end) end
+end
+
+-- Saved configs restore control VALUES without firing callbacks — the library
+-- only calls back for user interaction. Without this the menu would show a
+-- loaded setting while the feature ran on its default.
+local APPLY = {}
+
+local function remember(flag, apply)
+	if flag and apply then APPLY[flag] = apply end
+end
+
+local function syncFlags()
+	local flags = (window and window.Flags) or (Library and Library.Flags)
+	if type(flags) ~= "table" then return end
+	for flag, apply in pairs(APPLY) do
+		local v = flags[flag]
+		if v ~= nil then pcall(apply, v) end
+	end
+end
+
+local function toggle(sec, flag, text, default, onChanged, hint)
 	if not sec then return nil end
-	return sec:AddToggle(flag, {
-		Text    = text,
+	local ctrl = sec:AddToggle({
+		Name    = text,
+		Flag    = flag,
 		Default = default and true or false,
-		Tooltip = tooltip,
-		Callback = function(state)
-			if onChanged then pcall(onChanged, state and true or false) end
+		Callback = function(v)
+			if onChanged then pcall(onChanged, v and true or false) end
 		end,
 	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
 end
 
-local function slider(sec, flag, text, min, max, default, step, suffix, onChanged, tooltip)
+-- The library formats the value with `Decimals` but derives nothing from Step,
+-- so a 0.05 step declared as Decimals 0 drew 0.6 as "( 1 s )" and 0.3 as
+-- "( 0 s )". Read the precision back out of the step instead of guessing.
+local function stepDecimals(step)
+	if not step then return 0 end
+	local s = tostring(step)
+	local dot = s:find(".", 1, true)
+	return dot and (#s - dot) or 0
+end
+
+local function slider(sec, flag, text, min, max, default, step, suffix, onChanged, hint)
 	if not sec then return nil end
-	return sec:AddSlider(flag, {
-		Text      = text,
-		Min       = min,
-		Max       = max,
-		Default   = default,
-		Increment = step or 1,
-		Suffix    = suffix,
-		Tooltip   = tooltip,
-		Callback  = function(v)
+	local stepSize = step or 1
+	local ctrl = sec:AddSlider({
+		Name     = text,
+		Flag     = flag,
+		Min      = min,
+		Max      = max,
+		Default  = default,
+		Step     = stepSize,
+		Decimals = stepDecimals(stepSize),
+		Suffix   = suffix,
+		Callback = function(v)
 			if onChanged then pcall(onChanged, tonumber(v) or default) end
 		end,
 	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
 end
 
-local function dropdown(sec, flag, text, values, default, onChanged, tooltip)
+local function dropdown(sec, flag, text, options, default, onChanged, hint)
 	if not sec then return nil end
-	return sec:AddDropdown(flag, {
-		Text    = text,
-		Values  = values,
+	local ctrl = sec:AddDropdown({
+		Name    = text,
+		Flag    = flag,
+		Options = options,
 		Default = default,
-		Tooltip = tooltip,
 		Callback = function(v)
 			if onChanged then pcall(onChanged, v) end
 		end,
 	})
+	remember(flag, onChanged)
+	note(sec, hint)
+	return ctrl
 end
 
-local function button(sec, text, callback, tooltip)
+local function button(sec, text, callback, hint)
 	if not sec then return nil end
-	return sec:AddButton({ Text = text, Callback = callback, Tooltip = tooltip })
+	local ctrl = sec:AddButton({ Name = text, Callback = callback })
+	note(sec, hint)
+	return ctrl
 end
 
+-- AddLabel hands back a status line: :Set(text), :SetColor(c), :SetVisible(b).
 local function label(sec, text)
 	if not sec then return nil end
-	return sec:AddLabel({ Text = tostring(text or "") })
+	return sec:AddLabel(tostring(text or ""))
 end
 
 local function setText(ctrl, text)
-	if ctrl then pcall(function() ctrl:SetText(tostring(text)) end) end
+	if not ctrl then return end
+	if type(ctrl.Set) == "function" then
+		pcall(function() ctrl:Set(tostring(text)) end)
+	elseif type(ctrl.SetText) == "function" then
+		pcall(function() ctrl:SetText(tostring(text)) end)
+	end
 end
 
 local function notify(text, title, dur)
 	pcall(function()
-		Library:Notify({ Title = title or "Eternity", Content = tostring(text), Duration = tonumber(dur) or 4 })
+		window:Notify({ Title = title or "Eternity", Text = tostring(text), Duration = tonumber(dur) or 4 })
 	end)
 end
+
+----------------------------------------------------------------------
+-- menu options that belong to the window rather than to a feature
+----------------------------------------------------------------------
+local secMenu = section("Status", "MENU")
+toggle(secMenu, "menu_watermark", "Watermark", false, function(v)
+	pcall(function() window:SetWatermark(v) end)
+end, "fps, ping and clock in one strip")
+dropdown(secMenu, "menu_palette", "Palette",
+	{ "Default", "Navy", "Midnight", "Rose", "Forest", "Light" }, "Default",
+	function(v) pcall(function() window:SetPalette(v) end) end)
+slider(secMenu, "menu_scale", "Menu scale", 60, 160, 100, 5, "%", function(v)
+	pcall(function() window:SetScale(v / 100) end)
+end)
+button(secMenu, "Unload", function()
+	-- runs the same teardown a reload does, without needing one
+	pcall(SESSION.teardown)
+end, "disconnect everything and close the menu")
 ----------------------------------------------------------------------
 -- WALKER
 ----------------------------------------------------------------------
@@ -342,7 +433,12 @@ local function groundPoint(pos)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	local mobsFolder = workspace:FindFirstChild("Mobs")
-	params.FilterDescendantsInstances = mobsFolder and { c, mobsFolder } or { c }
+	-- built explicitly: { c, mobsFolder } with c nil leaves a hole in the array,
+	-- which RaycastParams does not accept
+	local filter = {}
+	if c then filter[#filter + 1] = c end
+	if mobsFolder then filter[#filter + 1] = mobsFolder end
+	params.FilterDescendantsInstances = filter
 	local hit = workspace:Raycast(pos + Vector3.new(0, 3, 0), Vector3.new(0, -400, 0), params)
 	return hit and hit.Position or pos
 end
@@ -629,16 +725,23 @@ every(0.05, function()
 	local c, hrp, hum = character()
 	if not (c and hrp and hum and hum.Health > 0) then return end
 
-	-- survival before offence: guard while hurt, and never swing into guard
+	-- survival before offence: guard while hurt, and never swing into guard.
+	-- The setGuard(true) on EVERY path while held is what keeps Block alive: the
+	-- server drops a held input whose re-ping stops arriving, so returning early
+	-- between the two thresholds silently lost the guard.
 	local pct = healthPct()
-	if CFG.guard and pct then
-		if pct <= CFG.guardPct then
+	if CFG.guard and pct ~= nil then
+		if ST.guardHeld then
+			if pct >= CFG.resumePct then
+				setGuard(false)
+			else
+				setGuard(true)
+				ST.status = ("guarding (%d%%)"):format(math.floor(pct))
+				return
+			end
+		elseif pct <= CFG.guardPct then
 			setGuard(true)
 			ST.status = ("guarding (%d%%)"):format(math.floor(pct))
-			return
-		elseif ST.guardHeld and pct >= CFG.resumePct then
-			setGuard(false)
-		elseif ST.guardHeld then
 			return
 		end
 	end
@@ -661,17 +764,14 @@ every(0.05, function()
 end, "combat-aura")
 
 every(0.25, function()
-	if not (SESSION.alive and CFG.guard and CFG.aura) then
-		if ST.guardHeld then setGuard(false) end
-		return
+	-- release only: keeping it up is the aura's job, so there is exactly one
+	-- place that pings and one place that lets go
+	local wantGuard = SESSION.alive and CFG.aura and CFG.guard
+	local _, _, hum = character()
+	if ST.guardHeld and (not wantGuard or not hum or hum.Health <= 0) then
+		setGuard(false)
 	end
-	if ST.guardHeld and not CFG.guard then setGuard(false) end
-	if ST.guardHeld then
-		-- keep the held input alive while the aura is idle
-		local _, _, hum = character()
-		if not hum or hum.Health <= 0 then setGuard(false) end
-	end
-end, "combat-guard-keep")
+end, "combat-guard-release")
 
 ----------------------------------------------------------------------
 -- potions
@@ -803,9 +903,14 @@ local POOL_MAX      = 28
 local PLAYER_POOL   = 12
 local pool          = {}
 local playerPool    = {}
-local shown         = setmetatable({}, { __mode = "k" })
-local shownPlayers  = setmetatable({}, { __mode = "k" })
+-- Strong keys on purpose. With weak keys a destroyed model is collected without
+-- its highlight record ever being marked free, so the pool silently fills with
+-- entries nobody can reuse and ESP stops drawing. A dead model is dropped on
+-- the next tick anyway, because the diff checks model.Parent.
+local shown         = {}
+local shownPlayers  = {}
 local lastColour    = nil
+local lastPlayerColour = nil
 
 local function makeHighlight(adornee)
 	local hl = Instance.new("Highlight")
@@ -923,16 +1028,22 @@ every(0.4, function()
 			shownPlayers[model] = nil
 		end
 	end
+	local recolour = ESP.playerColour ~= lastPlayerColour
 	for model in pairs(want) do
-		if not shownPlayers[model] then
-			local rec = acquire(playerPool, model, PLAYER_POOL)
+		local rec = shownPlayers[model]
+		if not rec then
+			rec = acquire(playerPool, model, PLAYER_POOL)
 			if rec then
 				rec.obj.FillColor = ESP.playerColour
 				rec.obj.OutlineColor = ESP.playerColour
 				shownPlayers[model] = rec
 			end
+		elseif recolour then
+			rec.obj.FillColor = ESP.playerColour
+			rec.obj.OutlineColor = ESP.playerColour
 		end
 	end
+	lastPlayerColour = ESP.playerColour
 end, "esp-players")
 
 ----------------------------------------------------------------------
@@ -1100,6 +1211,13 @@ every(0.35, function()
 			if WALK.label == "ore" then walkStop() end
 			return
 		end
+		-- The walker abandons a fixed goal after ~2 s of no progress. Without
+		-- re-issuing the walk here the node stayed selected and nothing ever
+		-- moved again, which looks exactly like a frozen auto-mine.
+		if WALK.label ~= "ore" and now() - MINE.lastSeek > 1 then
+			MINE.lastSeek = now()
+			walkTo(centre or t:GetPivot().Position, "ore")
+		end
 		return
 	end
 
@@ -1177,8 +1295,11 @@ every(0.4, function()
 		end
 		if MOVE.jumpTouched then
 			MOVE.jumpTouched = nil
-			local was = MOVE.jumpWas
+			local was, useWas = MOVE.jumpWas, MOVE.jumpUseWas
 			if was then pcall(function() hum.JumpPower = was end) end
+			-- forcing UseJumpPower on is part of the change, so it has to be
+			-- handed back too or the game's JumpHeight stops applying
+			if useWas ~= nil then pcall(function() hum.UseJumpPower = useWas end) end
 		end
 		return
 	end
@@ -1188,7 +1309,10 @@ every(0.4, function()
 		MOVE.speedTouched = true
 	end
 	if MOVE.jumpOn then
-		if MOVE.jumpWas == nil then MOVE.jumpWas = hum.JumpPower end
+		if MOVE.jumpWas == nil then
+			MOVE.jumpWas = hum.JumpPower
+			MOVE.jumpUseWas = hum.UseJumpPower
+		end
 		hum.UseJumpPower = true
 		hum.JumpPower = MOVE.jump
 		MOVE.jumpTouched = true
@@ -1205,7 +1329,9 @@ local function bindInfJump(hum)
 	if not hum or boundJumps[hum] then return end
 	boundJumps[hum] = true
 	hold(hum.StateChanged:Connect(function(_, new)
-		if MOVE.handsOff or not MOVE.infJump then return end
+		-- independent of hands-off: that switch is about writing WalkSpeed and
+		-- JumpPower, and infinite jump only re-triggers a state
+		if not MOVE.infJump then return end
 		if new == Enum.HumanoidStateType.Freefall then
 			pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
 		end
@@ -1337,15 +1463,10 @@ function SESSION.teardown()
 	end
 	SESSION.vis = {}
 
-	pcall(function()
-		if type(Library) == "table" and type(Library.Unload) == "function" then
-			Library:Unload()
-		end
-	end)
-	pcall(function()
-		local gui = Library and (Library.ScreenGui or Library.Gui)
-		if gui and gui.Parent then gui:Destroy() end
-	end)
+	-- the library owns its ScreenGui and every connection behind it
+	if SESSION.window and type(SESSION.window.Destroy) == "function" then
+		pcall(function() SESSION.window:Destroy() end)
+	end
 
 	if genv and genv.PE == SESSION then genv.PE = nil end
 end
@@ -1357,5 +1478,6 @@ table.insert(SESSION.restore, function()
 	end
 end)
 
+syncFlags()   -- a loaded config restores values without firing callbacks
 startScheduler()
 notify("Loaded · F4 opens the menu", "Eternity " .. SESSION.build, 5)

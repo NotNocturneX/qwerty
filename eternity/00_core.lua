@@ -1,6 +1,6 @@
 -- Project Eternity — fork
 -- Place 108438460215241 (Sword Art: Eternity, MOTE Games), placeVersion 1045.
--- Executor: Real · UI: Raven
+-- Executor: Real · UI: UI/Utils.lua (Autofarm-Script-Sbor)
 --
 -- This is one Lua chunk split across numbered files. A local declared in a lower
 -- number is visible to every file above it, so the numeric order IS the load
@@ -110,9 +110,13 @@ local CH = { char = nil, hrp = nil, hum = nil }
 
 local function resolveCharacter()
 	local c = player.Character
-	if c == CH.char then return CH.char, CH.hrp, CH.hum end
-	CH.char, CH.hrp, CH.hum = c, nil, nil
-	if c then
+	if c ~= CH.char then
+		CH.char, CH.hrp, CH.hum = c, nil, nil
+	end
+	-- CharacterAdded fires before the body is assembled, so a cache filled only
+	-- on that event can hold nil for the rest of the character's life. Re-resolve
+	-- while either part is missing or has been removed.
+	if c and (not CH.hrp or not CH.hrp.Parent or not CH.hum or not CH.hum.Parent) then
 		CH.hrp = c:FindFirstChild("HumanoidRootPart")
 		CH.hum = c:FindFirstChildOfClass("Humanoid")
 	end

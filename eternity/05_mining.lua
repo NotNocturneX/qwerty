@@ -136,6 +136,13 @@ every(0.35, function()
 			if WALK.label == "ore" then walkStop() end
 			return
 		end
+		-- The walker abandons a fixed goal after ~2 s of no progress. Without
+		-- re-issuing the walk here the node stayed selected and nothing ever
+		-- moved again, which looks exactly like a frozen auto-mine.
+		if WALK.label ~= "ore" and now() - MINE.lastSeek > 1 then
+			MINE.lastSeek = now()
+			walkTo(centre or t:GetPivot().Position, "ore")
+		end
 		return
 	end
 

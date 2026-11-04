@@ -36,8 +36,11 @@ every(0.4, function()
 		end
 		if MOVE.jumpTouched then
 			MOVE.jumpTouched = nil
-			local was = MOVE.jumpWas
+			local was, useWas = MOVE.jumpWas, MOVE.jumpUseWas
 			if was then pcall(function() hum.JumpPower = was end) end
+			-- forcing UseJumpPower on is part of the change, so it has to be
+			-- handed back too or the game's JumpHeight stops applying
+			if useWas ~= nil then pcall(function() hum.UseJumpPower = useWas end) end
 		end
 		return
 	end
@@ -47,7 +50,10 @@ every(0.4, function()
 		MOVE.speedTouched = true
 	end
 	if MOVE.jumpOn then
-		if MOVE.jumpWas == nil then MOVE.jumpWas = hum.JumpPower end
+		if MOVE.jumpWas == nil then
+			MOVE.jumpWas = hum.JumpPower
+			MOVE.jumpUseWas = hum.UseJumpPower
+		end
 		hum.UseJumpPower = true
 		hum.JumpPower = MOVE.jump
 		MOVE.jumpTouched = true
@@ -64,7 +70,9 @@ local function bindInfJump(hum)
 	if not hum or boundJumps[hum] then return end
 	boundJumps[hum] = true
 	hold(hum.StateChanged:Connect(function(_, new)
-		if MOVE.handsOff or not MOVE.infJump then return end
+		-- independent of hands-off: that switch is about writing WalkSpeed and
+		-- JumpPower, and infinite jump only re-triggers a state
+		if not MOVE.infJump then return end
 		if new == Enum.HumanoidStateType.Freefall then
 			pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
 		end
