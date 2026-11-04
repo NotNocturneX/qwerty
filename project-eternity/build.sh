@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
 # build.sh — concatenate all source modules into one deployable Lua file
 # Usage: ./build.sh [output]
-#   output defaults to dist/huffs-sae-stuff.lua
+#   output defaults to huffs-sae-stuff.lua beside this script
+#
+# The modules live beside this script, so it can be run from any directory.
 
-set -e
+set -eu
 
-OUTDIR="dist"
-OUTFILE="${1:-$OUTDIR/huffs-sae-stuff.lua}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTFILE="${1:-$HERE/huffs-sae-stuff.lua}"
 
-mkdir -p "$OUTDIR"
+mkdir -p "$(dirname "$OUTFILE")"
 
 # Files are loaded in numbered order: 00_ first, 11_ last.
 # Each file depends on the upvalues established by the ones before it —
 # this order must not change.
-cat src/00_session.lua \
-    src/01_walker.lua \
-    src/02_library.lua \
-    src/03_anticheat.lua \
-    src/04_combat.lua \
-    src/05_esp.lua \
-    src/06_visuals.lua \
-    src/07_mining.lua \
-    src/08_rings.lua \
-    src/09_movement.lua \
-    src/10_ui.lua \
-    src/11_cleanup.lua \
+cat "$HERE/00_session.lua" \
+    "$HERE/01_walker.lua" \
+    "$HERE/02_library.lua" \
+    "$HERE/03_anticheat.lua" \
+    "$HERE/04_combat.lua" \
+    "$HERE/05_esp.lua" \
+    "$HERE/06_visuals.lua" \
+    "$HERE/07_mining.lua" \
+    "$HERE/08_rings.lua" \
+    "$HERE/09_movement.lua" \
+    "$HERE/10_ui.lua" \
+    "$HERE/11_cleanup.lua" \
     > "$OUTFILE"
 
 LINES=$(wc -l < "$OUTFILE")

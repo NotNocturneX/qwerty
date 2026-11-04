@@ -2141,7 +2141,6 @@ SESSION.World = WORLD   -- here, not in the exposure block above: WORLD is
                         -- would quietly store nil.
 
 ----------------------------------------------------------------------
-----------------------------------------------------------------------
 -- 7. VISUALS
 ----------------------------------------------------------------------
 -- Brightness and fog are SEPARATE here, because they are separate things in the

@@ -8,7 +8,7 @@ UI library: **Neverlose** · Executor: **Real**
 ## Structure
 
 ```
-src/
+project-eternity/
 ├── 00_session.lua    — Re-execution guard, Roblox services, session table, orphan sweep, shared helpers
 ├── 01_walker.lua     — WALK state, pathfinding loop, RenderStepped steering, smooth heading
 ├── 02_library.lua    — NeverLose load, window + watermark creation, branding
@@ -20,7 +20,9 @@ src/
 ├── 08_rings.lua      — Range circles (RING), path visualiser (PATHVIS), cursor unlock (CURSOR)
 ├── 09_movement.lua   — MOVE (speed/jump/noclip/autojump), zone-return loop, MISC (anti-AFK)
 ├── 10_ui.lua         — All NeverLose tab/section/control construction
-└── 11_cleanup.lua    — HUD refresh loop, cleanupAll, SESSION.Teardown, startup hooks
+├── 11_cleanup.lua    — HUD refresh loop, cleanupAll, SESSION.Teardown, startup hooks
+├── build.sh          — Concatenates the modules in numbered order
+└── huffs-sae-stuff.lua — Build output; regenerate with ./build.sh
 ```
 
 Each file is a flat Lua chunk that shares upvalues with every file before it.  
@@ -32,11 +34,13 @@ Each file is a flat Lua chunk that shares upvalues with every file before it.
 
 ```bash
 chmod +x build.sh
-./build.sh                          # → dist/huffs-sae-stuff.lua
+./build.sh                          # → huffs-sae-stuff.lua
 ./build.sh path/to/custom_out.lua   # custom path
 ```
 
 Paste the contents of the output file into your executor.
+
+`build.sh` resolves its own directory, so it can be run from anywhere; by default it overwrites the tracked bundle at the repo root.
 
 ---
 
@@ -49,7 +53,7 @@ Paste the contents of the output file into your executor.
 | 3 | `04_combat.lua` — aura loop | `os.clock()` called **once** per tick as `local now`; previously called up to 10 times per tick at 33 Hz |
 | 4 | `04_combat.lua` — `swingAt` | `hpOf()` moved to module scope; previously a new closure was allocated on every swing |
 | 5 | `04_combat.lua` — `swingAt` | Target list built with `table.create(#models)` + index assignment; avoids `table.insert` overhead |
-| 6 | `04_combat.lua` `05_esp.lua` `07_mining.lua` | `while table.remove` loops replaced with nil-truncation (`for i = lim+1, #out do out[i] = nil end`) in `liveMobs`, `pickMobs`, `livePlayers`, `oreNodes` |
+| 6 | `04_combat.lua` `07_mining.lua` | `while table.remove` loops replaced with nil-truncation (`for i = lim+1, #out do out[i] = nil end`) in `liveMobs`, `pickMobs`, `livePlayers`, `oreNodes` |
 | 7 | `01_walker.lua` — RenderStepped | `groundPoint` raycast throttled to fire only when the chased mob moves > 2 studs; previously fired at 60 Hz while chasing (~50 saved raycasts/s) |
 
 ---

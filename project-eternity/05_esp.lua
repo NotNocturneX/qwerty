@@ -305,4 +305,3 @@ SESSION.World = WORLD   -- here, not in the exposure block above: WORLD is
                         -- declared in this section, so assigning it earlier
                         -- would quietly store nil.
 
-----------------------------------------------------------------------
