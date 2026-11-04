@@ -305,3 +305,202 @@ SESSION.World = WORLD   -- here, not in the exposure block above: WORLD is
                         -- declared in this section, so assigning it earlier
                         -- would quietly store nil.
 
+----------------------------------------------------------------------
+-- 6c. PLACE NAMES — the map's own labels, floated over the world
+----------------------------------------------------------------------
+-- The game names its own places; none of this is invented. Read off Floor 2:
+--   workspace.MapAnchors      Skalvik, Frosthaven, Eirholm   (the towns)
+--   Floor2.MobZones           SouthernRise_EvilSnowman_Lv25-26, and friends —
+--                             area, mob and level range all encoded in the name
+--   Floor2.MinibossArenas     RimecrownIsle, TyrantsHollow, SentinelGarrison
+--   Floor2.FishingSpots       FishingSpot_Frosthaven, ...
+--   Floor2.Lookouts           West/East/North
+--   Floor2.Dungeon / BossRoom with human names on their own prompts
+--
+-- The folder names are per-floor, so this looks for whichever FloorN exists
+-- rather than hard-coding Floor2.
+local PLACES = {
+	enabled  = false,
+	range    = 6000,
+	-- Each category is its own switch, so the mob-zone clutter can go without
+	-- taking the towns with it.
+	cats     = { Towns = true, Bosses = true },
+	colour   = Color3.fromRGB(255, 255, 255),
+	shown    = 0,
+	labels   = {},
+	maxLabels = 28,
+	lastScan = 0,
+	cache    = {},
+
+	-- Two tiers. A town and a boss room are landmarks you navigate by, so they
+	-- float well above the terrain and read from a distance; a fishing spot or
+	-- a lookout is detail and sits low, near the thing it names. Without this
+	-- everything hung at the same height and a town was indistinguishable from
+	-- a pond.
+	majorHeight = 70,
+	minorHeight = 18,
+	majorSize   = 20,
+	minorSize   = 13,
+}
+
+-- Which categories are landmarks rather than detail.
+local PLACE_MAJOR = { Towns = true, Bosses = true }
+
+-- "FrosthavenSouth_IceWasp_Lv21-22" reads badly floating over a hillside.
+local function prettyPlace(name)
+	-- "FishingSpot_Frosthaven" used to come out as plain "Frosthaven", which is
+	-- also the name of the TOWN — two labels reading the same thing a few
+	-- hundred studs apart. Keep the kind in the name.
+	local s = tostring(name)
+	local spot = s:match("^FishingSpot_(.+)$")
+	if spot then
+		s = spot .. "_Fishing"
+	end
+	s = s:gsub("_", " · ")
+	-- split camelCase, but leave runs of capitals and Lv21-22 alone
+	s = s:gsub("(%l)(%u)", "%1 %2")
+	return s
+end
+
+-- A Folder has no position of its own, so fall back to any BasePart under it.
+local function anyPosition(inst)
+	local ok, p = pcall(function()
+		if inst:IsA("BasePart") then return inst.Position end
+		if inst:IsA("Model") then return inst:GetPivot().Position end
+		return nil
+	end)
+	if ok and typeof(p) == "Vector3" then return p end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") then return d.Position end
+	end
+	-- MEASURED: the four miniboss arenas are Folders holding Models holding
+	-- nothing — their geometry is not streamed in until you are near. A part
+	-- search finds nothing, so all four were silently dropped. Their nested
+	-- Models still carry a real pivot, which is enough to put a label at.
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("Model") then
+			local okp, cf = pcall(function() return d:GetPivot() end)
+			if okp and cf and cf.Position.Magnitude > 1 then return cf.Position end
+		end
+	end
+	return nil
+end
+
+local function floorFolder()
+	for _, c in ipairs(workspace:GetChildren()) do
+		if c:IsA("Folder") and c.Name:match("^Floor%d+$") then return c end
+	end
+	return nil
+end
+
+-- Rebuilt rarely: these are static map features, not moving targets.
+local function scanPlaces()
+	local found = {}
+	local function add(cat, inst, label)
+		local p = anyPosition(inst)
+		if p then found[#found + 1] = { cat = cat, pos = p, text = label or prettyPlace(inst.Name) } end
+	end
+
+	local ma = workspace:FindFirstChild("MapAnchors")
+	if ma then
+		for _, c in ipairs(ma:GetChildren()) do add("Towns", c) end
+	end
+
+	local fl = floorFolder()
+	if fl then
+		local mz = fl:FindFirstChild("MobZones")
+		if mz then for _, c in ipairs(mz:GetChildren()) do add("Mob zones", c) end end
+		local ar = fl:FindFirstChild("MinibossArenas")
+		if ar then for _, c in ipairs(ar:GetChildren()) do add("Bosses", c) end end
+		local fs = fl:FindFirstChild("FishingSpots")
+		if fs then for _, c in ipairs(fs:GetChildren()) do add("Fishing", c) end end
+		local lo = fl:FindFirstChild("Lookouts")
+		if lo then for _, c in ipairs(lo:GetChildren()) do add("Lookouts", c) end end
+		for _, n in ipairs({ "Dungeon", "BossRoom" }) do
+			local d = fl:FindFirstChild(n)
+			if d then add("Bosses", d) end
+		end
+	end
+	PLACES.cache = found
+end
+
+local function releasePlaceLabels()
+	for _, rec in ipairs(PLACES.labels) do
+		rec.inUse = false
+		rec.gui.Enabled = false
+	end
+end
+
+loop(0.5, function()
+	if not SESSION.Alive then return end
+	if not PLACES.enabled then
+		if PLACES.shown > 0 then releasePlaceLabels() PLACES.shown = 0 end
+		return
+	end
+	local _, hrp = character()
+	if not hrp then return end
+
+	if os.clock() - PLACES.lastScan > 15 or #PLACES.cache == 0 then
+		PLACES.lastScan = os.clock()
+		scanPlaces()
+	end
+
+	releasePlaceLabels()
+	local list = {}
+	for _, pl in ipairs(PLACES.cache) do
+		if PLACES.cats[pl.cat] then
+			local d = (pl.pos - hrp.Position).Magnitude
+			if d <= PLACES.range then
+				list[#list + 1] = { pl = pl, dist = d }
+			end
+		end
+	end
+	table.sort(list, function(a, b) return a.dist < b.dist end)
+
+	local n = 0
+	for _, item in ipairs(list) do
+		if n >= PLACES.maxLabels then break end
+		local rec
+		for _, r in ipairs(PLACES.labels) do if not r.inUse then rec = r break end end
+		if not rec and #PLACES.labels < PLACES.maxLabels then
+			local gui = Instance.new("BillboardGui")
+			gui.Name = "PE_PlaceTag"
+			gui.AlwaysOnTop = true
+			gui.Size = UDim2.fromOffset(280, 26)
+			gui.Parent = workspace
+			track(gui)
+			local anchor = Instance.new("Part")
+			anchor.Name = "PE_PlaceAnchor"
+			anchor.Anchored, anchor.CanCollide, anchor.CanQuery, anchor.CanTouch = true, false, false, false
+			anchor.Transparency = 1
+			anchor.Size = Vector3.new(0.2, 0.2, 0.2)
+			anchor.Parent = workspace
+			track(anchor)
+			gui.Adornee = anchor
+			local txt = Instance.new("TextLabel")
+			txt.BackgroundTransparency = 1
+			txt.Size = UDim2.fromScale(1, 1)
+			txt.Font = Enum.Font.GothamBold
+			txt.TextStrokeTransparency = 0.3
+			txt.Parent = gui
+			rec = { gui = gui, txt = txt, anchor = anchor }
+			table.insert(PLACES.labels, rec)
+		end
+		if rec then
+			n = n + 1
+			local major = PLACE_MAJOR[item.pl.cat] == true
+			rec.inUse = true
+			rec.anchor.CFrame = CFrame.new(item.pl.pos
+				+ Vector3.new(0, major and PLACES.majorHeight or PLACES.minorHeight, 0))
+			rec.gui.Enabled = true
+			rec.txt.Text = ("%s  ·  %d"):format(item.pl.text, math.floor(item.dist))
+			rec.txt.TextColor3 = PLACES.colour
+			rec.txt.TextSize = major and PLACES.majorSize or PLACES.minorSize
+			rec.txt.Font = major and Enum.Font.GothamBold or Enum.Font.Gotham
+		end
+	end
+	PLACES.shown = n
+end)
+
+SESSION.Places = PLACES
+

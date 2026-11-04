@@ -32,11 +32,22 @@ loop(1, function()
 			sz == nil and "?" or (sz and "SAFE (regen)" or "field (no regen)"),
 			st == nil and "?" or tostring(st)))
 		UI.lblDet:SetText(("Detections caught: %d"):format(AC.detections))
-		UI.lblDefStat:SetText(("Telegraphs %d / parried %d / dodged %d")
-			:format(DEF.seen, DEF.parries, DEF.dodged))
+		do
+			local guard = "off"
+			if DEF.guard then
+				local c = character()
+				if c and c:GetAttribute("WeaponType") == nil then
+					guard = "no weapon"
+				else
+					guard = DEF.guardHeld and "UP" or "ready"
+				end
+			end
+			UI.lblDefStat:SetText(("Telegraphs %d / parried %d / dodged %d · guard %s")
+				:format(DEF.seen, DEF.parries, DEF.dodged, guard))
+		end
 		if UI.lblAutoMineStat then
-			UI.lblAutoMineStat:SetText(("Auto mine: %s · pickaxe tier %d · mined %d")
-				:format(tostring(MINE.status), MINE.myTier(), MINE.swings))
+			UI.lblAutoMineStat:SetText(("Auto mine: %s · tier %d · %d nodes, %d swings")
+				:format(tostring(MINE.status), MINE.myTier(), MINE.mined, MINE.swings))
 		end
 		if UI.lblSmithStat then
 			UI.lblSmithStat:SetText(("Forge: %s · made %d, refused %d")
@@ -72,6 +83,23 @@ loop(1, function()
 			local names = {}
 			for _, s in ipairs(PVP.skills) do names[#names + 1] = s.name end
 			UI.lblPvpSkillList:SetText("Loadout: " .. table.concat(names, ", "))
+		end
+		if UI.lblPlaces then
+			UI.lblPlaces:SetText(PLACES.enabled
+				and ("Places: %d shown of %d known"):format(PLACES.shown, #PLACES.cache)
+				or "Places: off")
+		end
+		if UI.lblRainbow then
+			local n = 0
+			for _ in pairs(RAINBOW.targets) do n = n + 1 end
+			UI.lblRainbow:SetText(RAINBOW.enabled
+				and ("Rainbow: %d of %d cycling"):format(n, #RAINBOW.list)
+				or "Rainbow: off")
+		end
+		if UI.lblQuestStat then
+			UI.lblQuestStat:SetText((QUEST.esp or QUEST.trail)
+				and ("Quest: " .. tostring(QUEST.note))
+				or "Quest: off")
 		end
 		if UI.lblWorldEsp then
 			if not (WORLD.chests or WORLD.loot) then
@@ -150,72 +178,3 @@ loop(1, function()
 	end)
 end)
 
-----------------------------------------------------------------------
--- 13. CLEANUP
-----------------------------------------------------------------------
-local cleanupRan = false
-local function cleanupAll()
-	if cleanupRan then return end
-	cleanupRan = true
-	SESSION.Alive = false
-
-	pcall(walkStop)
-	-- Blocking is a server-held attribute. Leaving it set would strand the
-	-- character in a guard it has nothing left running to release.
-	pcall(function() Combat:FireServer("Block", false) end)
-	-- hand AutoJump back if we turned it off
-	pcall(function()
-		local _, _, hum = character()
-		if hum and MOVE.autoJumpWas ~= nil then hum.AutoJumpEnabled = MOVE.autoJumpWas end
-	end)
-	for _, c in ipairs(SESSION.Conns) do pcall(function() c:Disconnect() end) end
-	for _, r in ipairs(SESSION.Restore) do pcall(r) end
-
-	-- same rule on unload: restore what was there, never blanket-solid
-	pcall(function() if MOVE.restoreCollision then MOVE.restoreCollision() end end)
-
-	task.defer(sweep)
-	task.delay(0.5, sweep)
-end
-
-do
-	local raw = NeverLose.Unload
-	NeverLose.Unload = function(self, ...)
-		pcall(cleanupAll)
-		return raw(self, ...)
-	end
-end
-
-function SESSION.Teardown()
-	cleanupAll()
-	pcall(function() NeverLose:Unload() end)
-end
-
-----------------------------------------------------------------------
--- 14. NEUTRALISE ADONIS ON LOAD
-----------------------------------------------------------------------
--- Every reload resets the toggles to their defaults, which left the Adonis
--- patch OFF while the rest of the menu was already running. That is how a
--- client ended up with its Luau VM frozen by Adonis's crash path mid-session.
--- The patch is cheap, reversible and has no effect on the game, so it applies
--- itself at startup rather than waiting to be switched on.
-task.defer(function()
-	if not SESSION.Alive then return end
-	local okAc, err = AC.apply()
-	if okAc then
-		acBadge:SetColor("Green")
-		pcall(function()
-			if NeverLose.Flags.ac_patch then NeverLose.Flags.ac_patch:SetValue(true) end
-		end)
-	else
-		acBadge:SetColor("Red")
-		warn("[ProjectEternity] Adonis patch failed on load: " .. tostring(err))
-	end
-end)
-
-Notification.new({
-	Title    = "Project Eternity",
-	Content  = "Loaded. Insert toggles the menu.",
-	Duration = 6,
-})
-Logging.new("cube-vertexes", "Project Eternity menu ready", 6)

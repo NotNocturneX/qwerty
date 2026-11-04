@@ -88,14 +88,18 @@ local function oreNodes(maxDist, limit, filter)
 		end
 	end
 	table.sort(out, function(a, b) return a.dist < b.dist end)
-	local lim = limit or 8
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 8) do table.remove(out) end
 	return out
 end
 
--- the aura: swing at whatever is already in reach
+-- The aura: swing at whatever is already in reach.
+--
+-- Auto mine drives this too. It used to only TRAVEL, and relied on the aura
+-- toggle being switched on separately to do the hitting — so turning on just
+-- "Auto mine" walked you to a node and left you standing in front of it doing
+-- nothing, which looks exactly like a broken feature. One toggle is enough now.
 loop(0.15, function()
-	if not (SESSION.Alive and MINE.enabled) then return end
+	if not (SESSION.Alive and (MINE.enabled or MINE.auto)) then return end
 	if os.clock() - MINE.last < MINE.interval then return end
 	local t = oreNodes(MINE.range, 1, MINE.types)[1]
 	if not t then return end
@@ -138,6 +142,9 @@ loop(0.35, function()
 	-- Is the node we are walking to still worth walking to?
 	local t = MINE.target
 	if t and (not t.Parent or t:GetAttribute("MinedOut") == true or not t:FindFirstChild("Ore")) then
+		-- It is gone, so that is one node actually mined. The counter used to be
+		-- bumped when a node was PICKED instead, which counted walking, not ore.
+		MINE.mined = MINE.mined + 1
 		MINE.target = nil
 		t = nil
 		if WALK.label == MINE_LABEL then pcall(walkStop) end
@@ -180,7 +187,6 @@ loop(0.35, function()
 		return
 	end
 	MINE.target = next1.node
-	MINE.mined = MINE.mined + 1
 	walkTo(next1.pos, MINE_LABEL)
 	MINE.status = ("walking to %s (%d studs)"):format(next1.ore, math.floor(next1.dist))
 end)

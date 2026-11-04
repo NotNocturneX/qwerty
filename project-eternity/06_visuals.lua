@@ -122,13 +122,34 @@ local DEF = {
 	-- auto parry. Combat is the same string-action bus the aura uses:
 	-- Client.Systems.Combat line 1053 fires Combat:FireServer("Parry", serverTime)
 	-- and gates itself on CombatConfig.block.parryCooldown.
-	-- Shared config says tapThreshold 0.15, parryWindow 0.4, parryCooldown 1.5.
+	-- Shared config says tapThreshold 0.15, parryWindow 0.4, parryCooldown 0.9.
+	--
+	-- THE COOLDOWN IS THE SERVER'S, not ours, and it cannot be removed. The
+	-- client gates itself on CombatConfig.block.parryCooldown in a local upvalue
+	-- (Combat:1326) which we bypass completely by firing the remote ourselves —
+	-- so it would be easy to assume spamming works. MEASURED: 70 parries fired
+	-- at 0.1s intervals over 7 seconds produced EIGHT server-side parries, with
+	-- gaps of 0.93, 0.93, 0.92, 1.14, 0.72, 0.93, 0.92. The server simply drops
+	-- the rest. Anything faster than ~0.9s is wasted traffic.
+	--
+	-- What was genuinely wrong here: this used to wait 1.5s, a number guessed
+	-- from an older reading of the config. The real figure is 0.9, so the parry
+	-- was firing at about two thirds of the rate the game actually allows.
 	parry = false,
 	parryLead = 0.20,    -- fire this long before the hit lands, into the 0.4s window
 	parryRange = 16,     -- do not parry something that cannot reach you
-	parryCooldown = 1.5,
+	parryCooldown = 0.9, -- overwritten from the game's own config on load
 	lastParry = 0,
 	parries = 0,
+
+	-- GUARD BETWEEN PARRIES. The cooldown cannot be shortened, so the answer to
+	-- "ten mobs around me" is to not stand there unprotected while it runs.
+	-- Holding Block cut damage from 42 to 4 over three hits when it was measured
+	-- in PvP, and it costs about 0.75 stamina a second, refunded on release.
+	-- Off by default: you cannot swing while guard is up.
+	guard      = false,
+	guardHeld  = false,
+	guardUntil = 0,
 
 	-- DASH on hits the game will not let you parry.
 	--
@@ -162,8 +183,15 @@ task.spawn(function()
 	if not node then return end
 	local ok, cfg = pcall(require, node)
 	if not (ok and type(cfg) == "table") then return end
-	if type(cfg.block) == "table" and tonumber(cfg.block.parryLevelGap) then
-		DEF.parryGap = tonumber(cfg.block.parryLevelGap)
+	if type(cfg.block) == "table" then
+		if tonumber(cfg.block.parryLevelGap) then
+			DEF.parryGap = tonumber(cfg.block.parryLevelGap)
+		end
+		-- take the cooldown from the game instead of a number typed in here,
+		-- which is how it ended up 1.5 when the real value is 0.9
+		if tonumber(cfg.block.parryCooldown) then
+			DEF.parryCooldown = tonumber(cfg.block.parryCooldown)
+		end
 	end
 	if type(cfg.dash) == "table" then
 		DEF.dashCooldown = tonumber(cfg.dash.cooldown) or DEF.dashCooldown
@@ -287,10 +315,14 @@ local function handleTelegraph(info)
 				-- drains stamina at CombatConfig.block.staminaDrainPerSecond.
 				-- Measured: a parry test left Blocking=true and stamina at 18/100.
 				-- The game's own code releases with Combat:FireServer("Block", false).
-				task.delay(0.35, function()
-					if not SESSION.Alive then return end
-					pcall(function() Combat:FireServer("Block", false) end)
-				end)
+				-- With Hold guard on we deliberately do NOT release: the block is
+				-- what covers the cooldown, and the guard loop owns it from here.
+				if not DEF.guard then
+					task.delay(0.35, function()
+						if not SESSION.Alive then return end
+						pcall(function() Combat:FireServer("Block", false) end)
+					end)
+				end
 			end)
 			return
 		end
@@ -311,6 +343,74 @@ local function handleTelegraph(info)
 		end
 	end
 end
+
+-- HOLD GUARD BETWEEN PARRIES.
+--
+-- The parry cooldown is the server's and cannot be shortened — 70 parries fired
+-- at 0.1s produced 8, spaced 0.93s. So the way to survive a pack is to spend the
+-- gap blocking rather than standing in it.
+--
+-- Block is a HELD input, not a latch: the configuration that actually set
+-- Blocking server-side re-sent it about every 0.4s, and a single fire did not
+-- take. It also needs a weapon out, and it stops you swinging — which is why
+-- this is a toggle and not always on.
+local DEF_GUARD_PING = 0.4
+local defGuardPinged = 0
+
+local function setDefGuard(on)
+	on = on and true or false
+	if DEF.guardHeld == on then
+		if on then
+			-- MEASURED against a wasp pack: a hit knocks the guard down
+			-- server-side, and the seconds where Blocking had lapsed cost 215,
+			-- 215 and 208 HP against 86, 43 and 28 for the seconds where it was
+			-- actually up. Re-pinging on a fixed 0.4s timer left those gaps
+			-- open, so re-assert the INSTANT the attribute is not true and fall
+			-- back to the timer only while it is holding.
+			local c = character()
+			local reallyUp = c and c:GetAttribute("Blocking") == true
+			if not reallyUp or os.clock() - defGuardPinged >= DEF_GUARD_PING then
+				defGuardPinged = os.clock()
+				pcall(function() Combat:FireServer("Block", true) end)
+			end
+		end
+		return
+	end
+	DEF.guardHeld = on
+	SESSION.DefGuard.held = on      -- so swingAt can see it without reaching forward
+	if on then SESSION.DefGuard.raisedAt = os.clock() end
+	defGuardPinged = os.clock()
+	pcall(function() Combat:FireServer("Block", on) end)
+end
+DEF.setGuard = setDefGuard
+SESSION.DefGuard.setGuard = setDefGuard
+
+loop(0.15, function()
+	if not SESSION.Alive then return end
+	if not DEF.guard then
+		setDefGuard(false)
+		return
+	end
+	-- A swing is in flight: stay down until its window closes, then resume.
+	if os.clock() < (SESSION.DefGuard.yieldUntil or 0) then
+		setDefGuard(false)
+		return
+	end
+
+	local c, hrp = character()
+	-- the server refuses Block with no weapon in hand, so do not pretend
+	if not (c and hrp) or c:GetAttribute("WeaponType") == nil then
+		setDefGuard(false)
+		return
+	end
+	-- only while something is actually close enough to hit you
+	local near = liveMobs(DEF.parryRange + 4, 1)[1]
+	setDefGuard(near ~= nil)
+end)
+
+table.insert(SESSION.Restore, function()
+	pcall(function() Combat:FireServer("Block", false) end)
+end)
 
 SESSION.Def = DEF
 SESSION.Pvp = PVP

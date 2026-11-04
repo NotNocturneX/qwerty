@@ -27,7 +27,6 @@ local function walkStop()
 	WALK.followModel, WALK.stopWithin = nil, nil
 	WALK.arrived = true
 	WALK.followSide, WALK.followUntil, WALK.bestDist = nil, nil, nil
-	WALK._lastGroundInput = nil   -- reset throttle so next chase gets a fresh raycast
 	if WALK.blockConn then
 		pcall(function() WALK.blockConn:Disconnect() end)
 		WALK.blockConn = nil
@@ -555,17 +554,10 @@ hold(RunService.RenderStepped:Connect(function()
 
 	-- Chasing: track the target between the 0.25s ticks too, so the last few
 	-- studs follow it smoothly rather than aiming at a quarter-second-old spot.
-	-- Throttled: groundPoint fires a raycast, so we only recompute it when the
-	-- mob has actually moved more than 2 studs rather than every frame.
 	if WALK.followModel then
 		local m = WALK.followModel
 		if m.Parent and (m:GetAttribute("Health") or 0) > 0 then
-			local pivot = m:GetPivot().Position
-			if not WALK._lastGroundInput
-				or (pivot - WALK._lastGroundInput).Magnitude > 2 then
-				WALK.goal = groundPoint(pivot)
-				WALK._lastGroundInput = pivot
-			end
+			WALK.goal = groundPoint(m:GetPivot().Position)
 		end
 		local gd = WALK.goal - hrp.Position
 		if Vector3.new(gd.X, 0, gd.Z).Magnitude <= (WALK.stopWithin or 6) then
@@ -738,3 +730,4 @@ hold(RunService.RenderStepped:Connect(function()
 	moveSmooth(hum, dir)
 end))
 
+----------------------------------------------------------------------

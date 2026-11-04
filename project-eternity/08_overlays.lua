@@ -242,11 +242,14 @@ end)
 -- which is the one place a write sticks.
 local CURSOR = { enabled = true, bound = false }
 
+-- Raven tracks this as Window.Opened. The old library exposed it as a Signal
+-- object you called GetValue on, and that is what this read -- so after the UI
+-- port it always came back false, the cursor was never freed, and opening the
+-- menu left you with no mouse to click it with.
 local function menuIsOpen()
-	local w = SESSION.Window
-	if not (w and w.Signal) then return false end
-	local ok, v = pcall(w.Signal.GetValue, w.Signal)
-	return ok and v == true
+	local L = SESSION.Library
+	local w = L and L.Windows and L.Windows[1]
+	return (w ~= nil) and (w.Opened == true)
 end
 
 local function cursorStep()

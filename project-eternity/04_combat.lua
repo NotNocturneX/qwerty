@@ -110,8 +110,7 @@ local function liveMobs(maxDist, limit, filter)
 		end
 	end
 	table.sort(out, function(a, b) return a.dist < b.dist end)
-	local lim = limit or 6
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 6) do table.remove(out) end
 	return out
 end
 
@@ -353,8 +352,7 @@ local function livePlayers(maxDist, limit)
 		end
 	end
 	table.sort(out, function(a, b) return a.dist < b.dist end)
-	local lim = limit or 6
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 6) do table.remove(out) end
 	return out
 end
 
@@ -516,8 +514,7 @@ local function pickMobs(maxDist, limit)
 			return a.dist < b.dist
 		end)
 	end
-	local lim = limit or 6
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 6) do table.remove(out) end
 	return out, vetoed
 end
 
@@ -553,14 +550,6 @@ local function setSprint(on)
 	pcall(function() Remotes.Sprint:FireServer(on and true or false) end)
 end
 
--- Mobs carry Health as an attribute; player characters carry it on the Humanoid.
--- Defined at module scope (not inside swingAt) so no closure is allocated per swing.
-local function hpOf(model)
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	if hum then return hum.Health end
-	return model:GetAttribute("Health") or 0
-end
-
 local function swingAt(models)
 	if #models == 0 then return false end
 	-- Blocking and swinging are mutually exclusive in this game, so a swing sent
@@ -569,8 +558,26 @@ local function swingAt(models)
 		COMBAT_STATE.status = "holding guard — not swinging"
 		return false
 	end
-	local list = table.create(#models)
-	for i, t in ipairs(models) do list[i] = t.model end
+
+	-- The mob guard and swinging are mutually exclusive: the server throws away
+	-- a swing sent while you are Blocking. With both switched on that produced
+	-- "stamina 5 — waiting" and no attacks at all, so the two features cancelled
+	-- each other out. Instead of making you choose, drop the guard for a moment,
+	-- let this swing land, and the guard loop puts it straight back up.
+	local DG = SESSION.DefGuard
+	if DG and DG.held then
+		-- let the guard hold its minimum spell before a swing may drop it
+		if os.clock() - (DG.raisedAt or 0) < (DG.minUp or 0.5) then
+			COMBAT_STATE.status = "guard up — swing waiting"
+			return false
+		end
+		DG.yieldUntil = os.clock() + (DG.window or 0.45)
+		if DG.setGuard then pcall(DG.setGuard, false) end
+		COMBAT_STATE.status = "guard down to swing"
+		return false
+	end
+	local list = {}
+	for _, t in ipairs(models) do table.insert(list, t.model) end
 
 	-- "Heavy" is the only special-cased kind: Client.Systems.Combat does
 	-- u40 = a1 == "Heavy" and branches the whole swing on it. Anything else is
@@ -623,6 +630,15 @@ local function swingAt(models)
 	-- counter sat at 0 through a whole session that took the character from
 	-- level 1 to level 2 — the mobs were dying, the counter was looking at one
 	-- model and missing the rest.
+	-- Mobs carry Health as an attribute; player characters carry it on the
+	-- Humanoid. Reading the wrong one makes every player look dead, which would
+	-- have the kill counter climbing forever against someone standing there fine.
+	local function hpOf(model)
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		if hum then return hum.Health end
+		return model:GetAttribute("Health") or 0
+	end
+
 	local snapshot = {}
 	for _, t in ipairs(models) do
 		snapshot[t.model] = hpOf(t.model)
@@ -711,24 +727,19 @@ end
 loop(0.03, function()
 	if not (SESSION.Alive and CFG.auraEnabled) then return end
 
-	-- Cache both expensive calls once per tick; several branches below need them.
-	local c, _, hum = character()
-	local now        = os.clock()
-
-	-- Inline healthPct: avoids a second character() call inside the helper.
-	local pct = (hum and hum.MaxHealth > 0) and (hum.Health / hum.MaxHealth * 100) or nil
+	local pct = healthPct()
 
 	-- potion first: cheaper than disengaging if it works
 	if CFG.potionOn and pct and pct <= CFG.potionPct
-		and now - COMBAT_STATE.lastPotion > 3 then
-		COMBAT_STATE.lastPotion = now
+		and os.clock() - COMBAT_STATE.lastPotion > 3 then
+		COMBAT_STATE.lastPotion = os.clock()
 		local stock = potionStock()
 		if stock == 0 then
 			COMBAT_STATE.status = "no health potions"
 			COMBAT_STATE.potionEmpty = true
 		else
 			COMBAT_STATE.potionEmpty = false
-			local hpBefore = hum and hum.Health or 0   -- reuse cached hum
+			local hpBefore = select(3, character()) and select(3, character()).Health or 0
 			pcall(function() Remotes.UsePotionSlot:FireServer(1) end)
 			task.delay(1.5, function()
 				local _, _, h = character()
@@ -743,8 +754,8 @@ loop(0.03, function()
 
 	if CFG.guardOn and pct then
 		if not COMBAT_STATE.disengaged and pct <= CFG.guardPct
-			and now > (COMBAT_STATE.guardGraceUntil or 0) then
-			COMBAT_STATE.disengagedAt = now
+			and os.clock() > (COMBAT_STATE.guardGraceUntil or 0) then
+			COMBAT_STATE.disengagedAt = os.clock()
 			COMBAT_STATE.disengaged = true
 			local near = liveMobs(CFG.auraRange * 3, 1)[1]
 			if CFG.retreat and near then retreatFrom(near.model) end
@@ -755,13 +766,13 @@ loop(0.03, function()
 		elseif COMBAT_STATE.disengaged
 			and (pct >= CFG.resumePct
 				or (CFG.resumeAfter > 0
-					and now - (COMBAT_STATE.disengagedAt or 0) > CFG.resumeAfter)) then
+					and os.clock() - (COMBAT_STATE.disengagedAt or 0) > CFG.resumeAfter)) then
 			COMBAT_STATE.disengaged = false
 			-- Timed resumes happen when health has NOT recovered, so without a
 			-- grace period it would disengage again on the very next tick and
 			-- nothing would ever be hit. This gives it a window to actually fight.
 			if pct < CFG.resumePct then
-				COMBAT_STATE.guardGraceUntil = now + math.max(CFG.resumeAfter * 0.5, 4)
+				COMBAT_STATE.guardGraceUntil = os.clock() + math.max(CFG.resumeAfter * 0.5, 4)
 			end
 			COMBAT_STATE.status = "re-engaged"
 			pcall(function()
@@ -774,8 +785,8 @@ loop(0.03, function()
 		end
 	end
 
-	-- stamina: swinging into an empty bar leaves nothing to block or parry with.
-	-- Reuse cached `c` instead of calling character() again.
+	-- stamina: swinging into an empty bar leaves nothing to block or parry with
+	local c = character()
 	if c and CFG.staminaFloor > 0 then
 		local st = tonumber(c:GetAttribute("Stamina"))
 		if st and st < CFG.staminaFloor then
@@ -793,10 +804,16 @@ loop(0.03, function()
 	-- hit. It now sits below target selection, so fighting a player can use its
 	-- own rate — and so farm seeking still runs on a tick the rate never blocks.
 
-	-- Everything inside the circle, or only what the farm filters allow
+	-- Everything inside the circle, or only what the farm filters allow.
+	--
+	-- "Hit everything in range" now means EVERYTHING. It used to still apply the
+	-- farm's mob-name filter, which is how a filter left on "Ice Wasp" made the
+	-- aura silently ignore all fourteen Evil Snowmen standing on top of you —
+	-- the toggle said one thing and did another. The filter is for CHOOSING what
+	-- to walk to; it has no business deciding what you hit back.
 	local targets, vetoed
 	if CFG.hitAll then
-		targets = liveMobs(CFG.auraRange, CFG.auraTargets, FARM.types)
+		targets = liveMobs(CFG.auraRange, CFG.auraTargets)
 	else
 		targets, vetoed = pickMobs(CFG.auraRange, CFG.auraTargets)
 	end
@@ -822,8 +839,8 @@ loop(0.03, function()
 						WALK.label or "", math.floor(walkDistance() or 0))
 				return
 			end
-			if now - FARM.lastSeek >= FARM.seekWait then
-				FARM.lastSeek = now
+			if os.clock() - FARM.lastSeek >= FARM.seekWait then
+				FARM.lastSeek = os.clock()
 				local list, vetoWhy = pickMobs(FARM.seekDist, 1)
 				local next_ = list[1]
 				if next_ then
@@ -842,7 +859,20 @@ loop(0.03, function()
 				return
 			end
 		end
-		COMBAT_STATE.status = "no target in range"
+		-- "no target in range" is a lie when there are mobs all round you and a
+		-- filter or a veto is quietly dropping them. Say which, so a setting left
+		-- on from an hour ago cannot masquerade as a broken aura.
+		local raw = liveMobs(CFG.auraRange, 32)
+		if #raw > 0 then
+			local why = "a filter"
+			if not CFG.hitAll then
+				local _, vetoWhy = pickMobs(CFG.auraRange, 32)
+				why = vetoWhy and ("Survival veto: " .. vetoWhy) or "the mob filter"
+			end
+			COMBAT_STATE.status = ("%d in range but skipped — %s"):format(#raw, why)
+		else
+			COMBAT_STATE.status = "no target in range"
+		end
 		return
 	end
 	-- Is a player in this list? If so the PvP settings take over.
@@ -859,7 +889,7 @@ loop(0.03, function()
 
 	local interval = CFG.auraInterval
 	if COMBAT_STATE.vsPlayer then interval = PVP.interval end
-	if not CFG.noCooldown and now - COMBAT_STATE.lastHit < interval then return end
+	if not CFG.noCooldown and os.clock() - COMBAT_STATE.lastHit < interval then return end
 
 	-- IN REACH — but reach means the SERVER'S reach, not the aura slider's.
 	-- CombatConfig.MAX_HIT_DISTANCE is 15. The aura range goes to 40, and this
@@ -879,13 +909,13 @@ loop(0.03, function()
 	-- Abilities, aimed at the player we are fighting. These go out on their own
 	-- remote and do not consume the swing, so they stack on top of it.
 	if vsPlayer and PVP.useSkills and playerPos
-		and now - PVP.lastSkill >= PVP.skillInterval then
-		PVP.lastSkill = now
+		and os.clock() - PVP.lastSkill >= PVP.skillInterval then
+		PVP.lastSkill = os.clock()
 		local okCast, which = castSkill(playerPos)
 		if okCast then COMBAT_STATE.status = "cast " .. tostring(which) end
 	end
 
-	COMBAT_STATE.lastHit = now
+	COMBAT_STATE.lastHit = os.clock()
 	swingAt(targets)
 end)
 

@@ -10,11 +10,42 @@
 -- 1. RE-EXECUTION GUARD
 ----------------------------------------------------------------------
 local genv = (type(getgenv) == "function") and getgenv() or nil
-if genv and genv.PE_Session and genv.PE_Session.Teardown then
-	pcall(genv.PE_Session.Teardown)
+if genv and genv.PE_Session then
+	local old = genv.PE_Session
+	if old.Teardown then pcall(old.Teardown) end
+	-- Belt and braces: if the previous run predates the ScreenGui cleanup, or
+	-- its teardown threw partway, its menu is still on screen. Destroy that
+	-- specific GUI — the one the old session recorded — rather than sweeping
+	-- gethui() blind, which would take other scripts' menus with it.
+	pcall(function()
+		local lib = old.Library
+		local gui = lib and (lib.ScreenGui or lib.Gui)
+		if gui and gui.Parent then gui:Destroy() end
+	end)
 end
 
 local SESSION = { Alive = true, Conns = {}, Restore = {}, Pool = {} }
+-- bumped by hand when verifying a reload actually replaced the running build
+SESSION.Build = "2026-11-03-b2"
+
+-- Shared handle for the mob guard. It lives here, at the top, because swingAt
+-- needs to lower the guard before it swings and swingAt is defined some 800
+-- lines BEFORE the defence section that owns it — a local declared later would
+-- be a nil global lookup from inside swingAt, which is exactly the bug that
+-- already cost a debugging session when tryJump was written below its caller.
+SESSION.DefGuard = {
+	held       = false,   -- is the block actually up
+	yieldUntil = 0,       -- keep it down until this time so a swing can land
+	window     = 0.45,    -- how long to stay down for one swing
+	raisedAt   = 0,       -- when the guard last went up
+	-- MEASURED: with No cooldown on, the aura swings about 30 times a second.
+	-- Yielding on every one of those refreshed the window continuously and the
+	-- guard never got back up at all — Blocking was up 0 of 12 samples. So the
+	-- guard has to earn a minimum spell up before a swing may lower it again,
+	-- which turns this into a duty cycle instead of the aura starving it out.
+	minUp      = 0.5,
+	setGuard   = nil,     -- filled in by the defence section
+}
 if genv then genv.PE_Session = SESSION end
 
 local Players            = game:GetService("Players")
@@ -116,7 +147,6 @@ local function walkStop()
 	WALK.followModel, WALK.stopWithin = nil, nil
 	WALK.arrived = true
 	WALK.followSide, WALK.followUntil, WALK.bestDist = nil, nil, nil
-	WALK._lastGroundInput = nil   -- reset throttle so next chase gets a fresh raycast
 	if WALK.blockConn then
 		pcall(function() WALK.blockConn:Disconnect() end)
 		WALK.blockConn = nil
@@ -644,17 +674,10 @@ hold(RunService.RenderStepped:Connect(function()
 
 	-- Chasing: track the target between the 0.25s ticks too, so the last few
 	-- studs follow it smoothly rather than aiming at a quarter-second-old spot.
-	-- Throttled: groundPoint fires a raycast, so we only recompute it when the
-	-- mob has actually moved more than 2 studs rather than every frame.
 	if WALK.followModel then
 		local m = WALK.followModel
 		if m.Parent and (m:GetAttribute("Health") or 0) > 0 then
-			local pivot = m:GetPivot().Position
-			if not WALK._lastGroundInput
-				or (pivot - WALK._lastGroundInput).Magnitude > 2 then
-				WALK.goal = groundPoint(pivot)
-				WALK._lastGroundInput = pivot
-			end
+			WALK.goal = groundPoint(m:GetPivot().Position)
 		end
 		local gd = WALK.goal - hrp.Position
 		if Vector3.new(gd.X, 0, gd.Z).Magnitude <= (WALK.stopWithin or 6) then
@@ -828,24 +851,36 @@ hold(RunService.RenderStepped:Connect(function()
 end))
 
 ----------------------------------------------------------------------
--- 3. LOAD NEVERLOSE
 ----------------------------------------------------------------------
-local ok, NeverLose = pcall(function()
-	return loadstring(game:HttpGet("https://git.gay/Cobruhehe/Neverlose/raw/branch/main/source.luau"))()
+-- 3. LOAD RAVEN  (+ a Neverlose-shaped shim)
+----------------------------------------------------------------------
+-- The menu runs on Raven UI now. The ~290 control calls further down were NOT
+-- rewritten: they still speak Neverlose and the shim below translates. One
+-- adapter to get wrong instead of 290 call sites.
+--
+-- Raven is a far better fit than the old library:
+--   * multi-select dropdowns are native (the mob and ore filters need them)
+--   * colour pickers have rainbow built in
+--   * DependsOn greys a control out until its parent toggle is on, which is
+--     exactly what Neverlose's AddOption groups meant
+--   * SetAccent / SetTheme are a real theme API, so the menu no longer has to
+--     be recoloured by walking its instances
+--   * every label has TextTruncate.AtEnd, so a long name is clipped with an
+--     ellipsis rather than running off the panel
+local RAVEN_URL = "https://raw.githubusercontent.com/ImLiwo/ui-repo/main/raven/Library.lua"
+
+local okLib, Library = pcall(function()
+	-- a local copy wins while you are editing the library itself
+	if type(isfile) == "function" and isfile("Raven/Library.lua") then
+		return loadstring(readfile("Raven/Library.lua"))()
+	end
+	return loadstring(game:HttpGet(RAVEN_URL))()
 end)
-if not ok or type(NeverLose) ~= "table" then
-	return warn("[ProjectEternity] Neverlose failed to load: " .. tostring(NeverLose))
+if not okLib or type(Library) ~= "table" then
+	return warn("[ProjectEternity] Raven failed to load: " .. tostring(Library))
 end
 
--- CRITICAL: Unload() is a silent no-op without this, and AddSignal only records
--- connections for later disconnection while this is already true. Must be set
--- before CreateWindow, which is when the library wires its own signals.
-NeverLose.UnloadEnabled = true
-SESSION.Library = NeverLose
-
-local Notification = NeverLose:CreateNotification()
-local Logging      = NeverLose:CreateLogger()
-local Indicator    = NeverLose:CreateIndicator()
+SESSION.Library = Library
 
 -- Branding. The loader can set getgenv().PE_BRAND to rename the menu without
 -- editing this file — either a plain string (the title) or a table with
@@ -865,14 +900,503 @@ local function brandOf(key, fallback)
 	return fallback
 end
 
+local NeverLose = (function()
+local NL = {}
+NL.UnloadEnabled = true
+NL.GlobalLogo    = "shield"
+NL.Scales        = { Default = 1, Small = 0.85, Large = 1.2, Mobile = 1.45 }
+
+-- MEASURED, not chosen by taste: with the key set to Insert, pressing Insert
+-- reaches Roblox as KeyCode "End" or "KeypadZero", never "Insert". Raven
+-- compares the pressed key name against the bound one, so the match never
+-- happened and the menu could not be opened or closed by keyboard at all.
+-- F4 was confirmed to arrive as "F4" and toggle correctly, so the key path
+-- itself is sound -- it is Insert specifically that does not report cleanly.
+-- F4 was the key actually tested in game: pressed, arrived as "F4", menu
+-- toggled. Nothing in this game or Roblox binds it, and function keys report
+-- cleanly -- which the Insert cluster demonstrably does not. Rebindable from
+-- Misc > MENU if you want something else.
+local MENU_KEY_DEFAULT = "F4"
+
+-- Neverlose hands back a flag object you call :SetValue / :GetValue on; Raven
+-- keeps controllers in Library.Options and values in Library.Flags. Resolved
+-- lazily through a metatable so nothing has to be registered by hand.
+NL.Flags = setmetatable({}, {
+	__index = function(_, flag)
+		local o = Library.Options and Library.Options[flag]
+		if not o then return nil end
+		return {
+			SetValue   = function(_, v) pcall(function() o:Set(v) end) end,
+			GetValue   = function() local ok, v = pcall(function() return o:Get() end) return ok and v or nil end,
+			SetVisible = function(_, v) pcall(function() o:SetVisible(v) end) end,
+			Control    = o,
+		}
+	end,
+})
+
+-- Neverlose used BuilderIcons names; Raven uses Lucide. An unknown name draws
+-- nothing, so the tab icons are mapped rather than passed through.
+local ICON = {
+	["crosshairs"] = "crosshair",      ["crosshairs-slash"] = "swords",
+	["person-simple-run"] = "rabbit",  ["pickaxe"] = "pickaxe",
+	["eye"] = "eye",                   ["book-open"] = "book-open",
+	["paint-brush"] = "palette",       ["cube-vertexes"] = "box",
+	["mouse-scrollwheel"] = "mouse-pointer-2", ["crop"] = "settings",
+	["gear"] = "settings",             ["circle-dot"] = "circle-dot",
+	["circle-slash"] = "ban",          ["arrow-rotate-left"] = "rotate-ccw",
+	["arrows-rotate"] = "refresh-cw",  ["check-all"] = "check-check",
+}
+local function lucide(name) return ICON[tostring(name)] or "circle" end
+
+-- Rounding is a digit count in Neverlose and a step size in Raven.
+local function stepFrom(rounding)
+	local r = tonumber(rounding) or 0
+	if r <= 0 then return 1 end
+	return 1 / (10 ^ r)
+end
+
+local LabelProxy = {}
+LabelProxy.__index = LabelProxy
+
+-- A Neverlose label is the NAME of the control that follows it, not a row of
+-- its own. Creating it eagerly drew everything twice — "Hit Aura" as a label
+-- and again as the toggle. So a label is only a promise: a control claims it
+-- and takes its text, and anything still unclaimed at the end is drawn as a
+-- plain label by FlushLabels.
+local pendingLabels = {}
+
+local function newLabel(section, text, dependsOn)
+	local p = setmetatable({
+		_sec = section, _text = tostring(text or ""),
+		_desc = nil, _made = nil, _dep = dependsOn,
+	}, LabelProxy)
+	pendingLabels[#pendingLabels + 1] = p
+	return p
+end
+
+local function claim(p)
+	for i, q in ipairs(pendingLabels) do
+		if q == p then
+			table.remove(pendingLabels, i)
+			break
+		end
+	end
+end
+
+function LabelProxy:ToolTip(text)
+	self._desc = text
+	if self._made then pcall(function() self._made:SetTooltip(text) end) end
+	return self
+end
+
+-- Common option shape for every control built off this label.
+function LabelProxy:_opts(o)
+	return {
+		Text = self._text,
+		Tooltip = self._desc,
+		DependsOn = self._dep,
+		Default = o and o.Default,
+		Callback = o and o.Callback,
+	}
+end
+
+-- A label can carry more than one control: "Walk to landmark" has a dropdown
+-- AND a toggle, "Speed" a slider and a toggle. _made used to be overwritten by
+-- whichever was added last, so a later call meant for the FIRST control hit the
+-- wrong object -- dropGo:SetValues() was calling Refresh on a toggle, and the
+-- landmark list could never populate. Controls are filed by kind as well now,
+-- and the setters ask for the kind they need.
+function LabelProxy:_keep(ctrl, kind)
+	claim(self)
+	self._made = ctrl
+	if kind then
+		self._byKind = self._byKind or {}
+		self._byKind[kind] = ctrl
+	end
+	return self
+end
+
+function LabelProxy:_of(kind)
+	return (self._byKind and self._byKind[kind]) or self._made
+end
+
+function LabelProxy:AddToggle(o)
+	local t = self:_opts(o)
+	return self:_keep(self._sec:AddToggle(o.Flag, t), "toggle")
+end
+
+function LabelProxy:AddSlider(o)
+	local t = self:_opts(o)
+	t.Min, t.Max = o.Min, o.Max
+	t.Increment = stepFrom(o.Rounding)
+	t.Suffix = o.Type
+	return self:_keep(self._sec:AddSlider(o.Flag, t), "slider")
+end
+
+function LabelProxy:AddDropdown(o)
+	local t = self:_opts(o)
+	t.Values = o.Values
+	t.Multi  = o.Multi == true
+	-- a multi dropdown's default is a set in Neverlose and a list in Raven
+	if t.Multi and type(o.Default) == "table" then
+		local list = {}
+		for k, v in pairs(o.Default) do
+			if v == true then list[#list + 1] = k
+			elseif type(v) == "string" then list[#list + 1] = v end
+		end
+		t.Default = list
+	end
+	return self:_keep(self._sec:AddDropdown(o.Flag, t), "dropdown")
+end
+
+function LabelProxy:AddColorPicker(o)
+	local t = self:_opts(o)
+	t.Rainbow = o.Rainbow
+	return self:_keep(self._sec:AddColorPicker(o.Flag, t), "color")
+end
+
+-- Raven splits what the old library ran through one Callback:
+--   Callback(state)      fires when the key is PRESSED or released
+--   ChangedCallback(key) fires when the bind is CHANGED to a different key
+-- The menu uses both kinds. Mapping everything onto Callback, as the first
+-- port did, meant the menu-key control never told anything it had been
+-- rebound -- you could pick a new key and the old one stayed live.
+--
+-- Callback here is the press handler and fires only on the down edge, so an
+-- action key does its job once per press rather than twice. OnRebind is the
+-- rebound handler. IsMenuKey hands the bind to Raven, which then keeps
+-- Library.MenuKey in step by itself.
+function LabelProxy:AddKeybind(o)
+	local t = self:_opts(o)
+	local press = o.Callback
+	t.Callback = press and function(state)
+		if state then press(state) end
+	end or nil
+	t.ChangedCallback = o.OnRebind and function(key) pcall(o.OnRebind, key) end or nil
+	t.IsMenuKey = o.IsMenuKey
+	-- an action key is held, not latched: Toggle would fire on alternate presses
+	t.Mode = o.Mode or (press and "Hold") or nil
+	return self:_keep(self._sec:AddKeybind(o.Flag, t), "keybind")
+end
+
+function LabelProxy:AddTextInput(o)
+	local t = self:_opts(o)
+	t.Placeholder = o.Placeholder
+	return self:_keep(self._sec:AddTextbox(o.Flag, t), "textbox")
+end
+
+function LabelProxy:AddButton(o)
+	return self:_keep(self._sec:AddButton({
+		Text = o.Name or self._text, Callback = o.Callback, Tooltip = self._desc,
+	}))
+end
+
+-- Neverlose nested extra controls under a parent with AddOption(). Raven has
+-- DependsOn, which greys them out until the parent toggle is on — the same
+-- intent, and it reads better than a flat run of rows.
+function LabelProxy:AddOption()
+	local sec, dep = self._sec, self._made and self._made.Flag or nil
+	return { AddLabel = function(_, name) return newLabel(sec, name, dep) end }
+end
+
+function LabelProxy:_materialise()
+	if self._made then return self._made end
+	claim(self)
+	self._made = self._sec:AddLabel({ Text = self._text })
+	return self._made
+end
+
+function LabelProxy:SetText(text)
+	self._text = tostring(text or "")
+	local made = self:_materialise()
+	pcall(function() made:SetText(self._text) end)
+	return self
+end
+LabelProxy.Set = LabelProxy.SetText
+
+-- Status rows colour themselves red/green to show state at a glance. Raven has
+-- no colour setter on a label -- it only offers Muted and Dimmed, which are
+-- theme greys -- so write the TextLabel directly. The colour is also stashed so
+-- it can be re-applied: Element:_refresh() repaints from the theme whenever the
+-- theme changes, and would otherwise wipe it the first time a colour is picked
+-- in the Customize tab.
+local NAMED = {
+	Red    = Color3.fromRGB(240, 96, 96),
+	Green  = Color3.fromRGB(96, 214, 128),
+	Yellow = Color3.fromRGB(240, 196, 64),
+	Blue   = Color3.fromRGB(96, 156, 240),
+	White  = Color3.fromRGB(236, 236, 236),
+	Grey   = Color3.fromRGB(142, 142, 142),
+	Gray   = Color3.fromRGB(142, 142, 142),
+}
+function LabelProxy:SetColor(c)
+	local col = (typeof(c) == "Color3") and c or NAMED[tostring(c)]
+	if not col then return self end
+	self._colour = col
+	local made = self._made
+	if made and made.Label then
+		pcall(function() made.Label.TextColor3 = col end)
+		-- re-assert after a theme repaint, which runs on the next frame
+		if not made._peColourHook then
+			made._peColourHook = true
+			local base = made._refresh
+			made._refresh = function(s, ...)
+				if base then base(s, ...) end
+				if self._colour and s.Label then s.Label.TextColor3 = self._colour end
+			end
+		end
+	end
+	return self
+end
+
+function LabelProxy:SetVisible(v)
+	if self._made then pcall(function() self._made:SetVisible(v) end) end
+	return self
+end
+function LabelProxy:SetValues(list)
+	local d = self:_of("dropdown")
+	if d then pcall(function() d:Refresh(list) end) end
+	return self
+end
+
+-- Sections ------------------------------------------------------------------
+local function wrapSection(sec)
+	return {
+		_raw = sec,
+		AddLabel = function(_, text) return newLabel(sec, text) end,
+		AddButton = function(_, o)
+			return sec:AddButton({ Text = o.Name, Callback = o.Callback })
+		end,
+		AddDivider = function() pcall(function() sec:AddDivider() end) end,
+	}
+end
+
+local function wrapTab(tab)
+	return {
+		_raw = tab,
+		AddSection = function(_, o)
+			return wrapSection(tab:AddSection({
+				Name = o.Name,
+				Side = (o.Position == "right") and "Right" or "Left",
+			}))
+		end,
+	}
+end
+
+-- Window --------------------------------------------------------------------
+local WindowMethods, RavenWindow = {}, nil
+local WindowProxy = {
+	__index = function(t, k)
+		if k == "UserSettings" then
+			local s = rawget(t, "_settings")
+			if not s then
+				-- Raven ships a Settings page; put our two controls on their own
+				-- tab rather than fighting it.
+				local tab = RavenWindow:AddTab({ Name = "Menu", Icon = "settings" })
+				s = wrapSection(tab:AddSection({ Name = "MENU", Side = "Left" }))
+				rawset(t, "_settings", s)
+			end
+			return s
+		end
+		if k == "Keybind" then return rawget(t, "_keybind") end
+		return WindowMethods[k]
+	end,
+	__newindex = function(t, k, v)
+		if k == "Keybind" then
+			rawset(t, "_keybind", v)
+			pcall(function() Library:SetMenuKey(typeof(v) == "EnumItem" and v.Name or tostring(v)) end)
+			return
+		end
+		rawset(t, k, v)
+	end,
+}
+
+function WindowMethods:AddTab(o)
+	return wrapTab(RavenWindow:AddTab({ Name = o.Name, Icon = lucide(o.Icon) }))
+end
+-- Neverlose's SetSize took a scale factor; Raven's window has a real UIScale
+-- behind Window:SetScale, so the menu-size dropdown maps straight onto it.
+function WindowMethods:SetSize(scale)
+	pcall(function() RavenWindow:SetScale(tonumber(scale) or 1) end)
+end
+function WindowMethods:ToggleInterface() pcall(function() Library:Toggle() end) end
+-- Raven draws its own watermark with the FPS, ping and clock already in it, so
+-- the blocks the menu used to build by hand are no longer written to -- they
+-- would only duplicate what is already there. AddBlock still returns something
+-- that accepts SetText so the HUD loop's calls stay harmless, and SetRender is
+-- wired to the real visibility switch so the Watermark toggle works.
+function WindowMethods:Watermark()
+	local stub = {}
+	function stub:SetText() return self end
+
+	-- Clicking the watermark toggles the menu. This existed before the port and
+	-- I stubbed it out, which removed the only way back in if the menu key ever
+	-- failed -- exactly what happened with Insert. It is the fallback that means
+	-- you can never be locked out, so it is wired to a real button now.
+	function stub:Input(fn)
+		pcall(function()
+			Library:_mount()
+			Library:_buildWatermark()
+			local frame = Library.Watermark and Library.Watermark.Frame
+			if not frame then return end
+			local old = frame:FindFirstChild("PE_WatermarkClick")
+			if old then old:Destroy() end
+			local btn = Instance.new("TextButton")
+			btn.Name = "PE_WatermarkClick"
+			btn.BackgroundTransparency = 1
+			btn.Text = ""
+			btn.AutoButtonColor = false
+			btn.Size = UDim2.fromScale(1, 1)
+			btn.ZIndex = 50
+			btn.Parent = frame
+			btn.MouseButton1Click:Connect(function() pcall(fn) end)
+		end)
+		return self
+	end
+
+	return {
+		AddBlock  = function() return stub end,
+		SetRender = function(_, v) pcall(function() Library:SetWatermarkVisible(v and true or false) end) end,
+	}
+end
+
+-- The brand tag used to be a TextLabel bolted onto the old library's header,
+-- found by hunting for its search glyph. Raven has no such glyph, so that hunt
+-- returned nothing and the tag silently never appeared. Raven's watermark
+-- takes a Suffix drawn next to the title in dim text, which is the same job
+-- done properly.
+function WindowMethods:SetHeaderTag(text)
+	pcall(function() Library:SetWatermark({ Suffix = tostring(text or "") }) end)
+end
+
+function NL:CreateWindow(o)
+	RavenWindow = Library:CreateWindow({
+		Title        = o.Name,
+		Suffix       = "",
+		Logo         = "shield",
+		Keybind      = o.Keybind or MENU_KEY_DEFAULT,
+		ConfigFolder = o.ConfigFolder or "ProjectEternity",
+		Size         = Vector2.new(880, 560),
+	})
+	NL.ScreenGui = Library.ScreenGui or Library.Gui
+	NL.Window = RavenWindow
+	local proxy = setmetatable({}, WindowProxy)
+	rawset(proxy, "_keybind", o.Keybind or MENU_KEY_DEFAULT)
+	return proxy
+end
+
+local function notify(title, text, dur)
+	pcall(function()
+		Library:Notify({ Title = title or "Project Eternity", Content = tostring(text or ""),
+			Duration = tonumber(dur) or 4 })
+	end)
+end
+
+function NL:CreateNotification()
+	return { new = function(a, b, c)
+		if type(a) == "table" then notify(a.Title, a.Content, a.Duration)
+		else notify(nil, b, c) end
+	end }
+end
+function NL:CreateLogger()
+	return { new = function(_, text, dur) notify("", text, dur) end }
+end
+-- Raven has no badge widget, and the anti-cheat indicator is worth keeping --
+-- it is the only always-on sign that the patcher is still holding. So it is
+-- drawn here: a small pill under the watermark, in its own ScreenGui so the
+-- menu's own teardown and theming never touch it.
+function NL:CreateIndicator()
+	return { new = function(o)
+		local badge = {}
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "PE_Indicator"
+		gui.ResetOnSpawn = false
+		gui.IgnoreGuiInset = true
+		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		gui.DisplayOrder = 9_999
+		pcall(function()
+			gui.Parent = (type(gethui) == "function" and gethui())
+				or game:GetService("CoreGui")
+		end)
+
+		local pill = Instance.new("Frame")
+		pill.Name = "Badge"
+		pill.AnchorPoint = Vector2.new(0, 0)
+		pill.Position = UDim2.new(0, 14, 0, 76)   -- clear of Raven's watermark
+		pill.Size = UDim2.new(0, 54, 0, 22)
+		pill.BackgroundColor3 = Color3.fromRGB(21, 21, 21)
+		pill.BorderSizePixel = 0
+		pill.Parent = gui
+		Instance.new("UICorner", pill).CornerRadius = UDim.new(0, 5)
+
+		local dot = Instance.new("Frame")
+		dot.AnchorPoint = Vector2.new(0, 0.5)
+		dot.Position = UDim2.new(0, 8, 0.5, 0)
+		dot.Size = UDim2.new(0, 6, 0, 6)
+		dot.BackgroundColor3 = Color3.fromRGB(240, 96, 96)
+		dot.BorderSizePixel = 0
+		dot.Parent = pill
+		Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+		local txt = Instance.new("TextLabel")
+		txt.BackgroundTransparency = 1
+		txt.Position = UDim2.new(0, 20, 0, 0)
+		txt.Size = UDim2.new(1, -24, 1, 0)
+		txt.Font = Enum.Font.GothamMedium
+		txt.TextSize = 11
+		txt.TextXAlignment = Enum.TextXAlignment.Left
+		txt.TextColor3 = Color3.fromRGB(236, 236, 236)
+		txt.Text = tostring((o and o.Name) or "AC")
+		txt.Parent = pill
+
+		local COL = {
+			Red   = Color3.fromRGB(240, 96, 96),
+			Green = Color3.fromRGB(96, 214, 128),
+			Amber = Color3.fromRGB(240, 196, 64),
+		}
+		function badge:SetRender(v) gui.Enabled = v and true or false return self end
+		function badge:SetText(t) txt.Text = tostring(t or "AC") return self end
+		function badge:SetColor(c)
+			dot.BackgroundColor3 = (typeof(c) == "Color3" and c) or COL[tostring(c)] or COL.Red
+			return self
+		end
+		-- Teardown goes through SESSION.Restore, NOT SESSION.Pool. Pool holds
+		-- the ESP's { Obj = Highlight, InUse = bool } records, and dropping a
+		-- bare ScreenGui in there made acquire() read h.Obj as nil on every
+		-- tick -- which killed the mob ESP outright, silently, because the
+		-- loop swallows its own errors.
+		if SESSION and SESSION.Restore then
+			table.insert(SESSION.Restore, function()
+				pcall(function() gui:Destroy() end)
+			end)
+		end
+		return badge
+	end }
+end
+
+function NL:Unload() pcall(function() Library:Unload() end) end
+function NL:RegisiterItem() end
+
+-- Anything no control claimed is a genuine standalone label (a status line, a
+-- heading), so draw it now that the menu is built.
+function NL:FlushLabels()
+	for _, p in ipairs(pendingLabels) do pcall(function() p:_materialise() end) end
+	pendingLabels = {}
+end
+
+return NL
+end)()
+
+local Notification = NeverLose:CreateNotification()
+local Logging      = NeverLose:CreateLogger()
+local Indicator    = NeverLose:CreateIndicator()
+
 local window = NeverLose:CreateWindow({
-	Logo             = NeverLose.GlobalLogo,
-	Name             = brandOf("name", "Project Eternity"),
-	Content          = brandOf("content", "Sword Art: Eternity"),
-	Size             = NeverLose.Scales.Default,
-	ConfigFolder     = "ProjectEternity",
-	Enable3DRenderer = false,
-	Keybind          = "Insert",
+	Logo         = NeverLose.GlobalLogo,
+	Name         = brandOf("name", "Project Eternity"),
+	Content      = brandOf("content", "Sword Art: Eternity"),
+	ConfigFolder = "ProjectEternity",
+	Keybind      = "F4",
 })
 
 SESSION.Window = window
@@ -1054,8 +1578,7 @@ local function liveMobs(maxDist, limit, filter)
 		end
 	end
 	table.sort(out, function(a, b) return a.dist < b.dist end)
-	local lim = limit or 6
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 6) do table.remove(out) end
 	return out
 end
 
@@ -1297,8 +1820,7 @@ local function livePlayers(maxDist, limit)
 		end
 	end
 	table.sort(out, function(a, b) return a.dist < b.dist end)
-	local lim = limit or 6
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 6) do table.remove(out) end
 	return out
 end
 
@@ -1460,8 +1982,7 @@ local function pickMobs(maxDist, limit)
 			return a.dist < b.dist
 		end)
 	end
-	local lim = limit or 6
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 6) do table.remove(out) end
 	return out, vetoed
 end
 
@@ -1497,14 +2018,6 @@ local function setSprint(on)
 	pcall(function() Remotes.Sprint:FireServer(on and true or false) end)
 end
 
--- Mobs carry Health as an attribute; player characters carry it on the Humanoid.
--- Defined at module scope (not inside swingAt) so no closure is allocated per swing.
-local function hpOf(model)
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	if hum then return hum.Health end
-	return model:GetAttribute("Health") or 0
-end
-
 local function swingAt(models)
 	if #models == 0 then return false end
 	-- Blocking and swinging are mutually exclusive in this game, so a swing sent
@@ -1513,8 +2026,26 @@ local function swingAt(models)
 		COMBAT_STATE.status = "holding guard — not swinging"
 		return false
 	end
-	local list = table.create(#models)
-	for i, t in ipairs(models) do list[i] = t.model end
+
+	-- The mob guard and swinging are mutually exclusive: the server throws away
+	-- a swing sent while you are Blocking. With both switched on that produced
+	-- "stamina 5 — waiting" and no attacks at all, so the two features cancelled
+	-- each other out. Instead of making you choose, drop the guard for a moment,
+	-- let this swing land, and the guard loop puts it straight back up.
+	local DG = SESSION.DefGuard
+	if DG and DG.held then
+		-- let the guard hold its minimum spell before a swing may drop it
+		if os.clock() - (DG.raisedAt or 0) < (DG.minUp or 0.5) then
+			COMBAT_STATE.status = "guard up — swing waiting"
+			return false
+		end
+		DG.yieldUntil = os.clock() + (DG.window or 0.45)
+		if DG.setGuard then pcall(DG.setGuard, false) end
+		COMBAT_STATE.status = "guard down to swing"
+		return false
+	end
+	local list = {}
+	for _, t in ipairs(models) do table.insert(list, t.model) end
 
 	-- "Heavy" is the only special-cased kind: Client.Systems.Combat does
 	-- u40 = a1 == "Heavy" and branches the whole swing on it. Anything else is
@@ -1567,6 +2098,15 @@ local function swingAt(models)
 	-- counter sat at 0 through a whole session that took the character from
 	-- level 1 to level 2 — the mobs were dying, the counter was looking at one
 	-- model and missing the rest.
+	-- Mobs carry Health as an attribute; player characters carry it on the
+	-- Humanoid. Reading the wrong one makes every player look dead, which would
+	-- have the kill counter climbing forever against someone standing there fine.
+	local function hpOf(model)
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		if hum then return hum.Health end
+		return model:GetAttribute("Health") or 0
+	end
+
 	local snapshot = {}
 	for _, t in ipairs(models) do
 		snapshot[t.model] = hpOf(t.model)
@@ -1655,24 +2195,19 @@ end
 loop(0.03, function()
 	if not (SESSION.Alive and CFG.auraEnabled) then return end
 
-	-- Cache both expensive calls once per tick; several branches below need them.
-	local c, _, hum = character()
-	local now        = os.clock()
-
-	-- Inline healthPct: avoids a second character() call inside the helper.
-	local pct = (hum and hum.MaxHealth > 0) and (hum.Health / hum.MaxHealth * 100) or nil
+	local pct = healthPct()
 
 	-- potion first: cheaper than disengaging if it works
 	if CFG.potionOn and pct and pct <= CFG.potionPct
-		and now - COMBAT_STATE.lastPotion > 3 then
-		COMBAT_STATE.lastPotion = now
+		and os.clock() - COMBAT_STATE.lastPotion > 3 then
+		COMBAT_STATE.lastPotion = os.clock()
 		local stock = potionStock()
 		if stock == 0 then
 			COMBAT_STATE.status = "no health potions"
 			COMBAT_STATE.potionEmpty = true
 		else
 			COMBAT_STATE.potionEmpty = false
-			local hpBefore = hum and hum.Health or 0   -- reuse cached hum
+			local hpBefore = select(3, character()) and select(3, character()).Health or 0
 			pcall(function() Remotes.UsePotionSlot:FireServer(1) end)
 			task.delay(1.5, function()
 				local _, _, h = character()
@@ -1687,8 +2222,8 @@ loop(0.03, function()
 
 	if CFG.guardOn and pct then
 		if not COMBAT_STATE.disengaged and pct <= CFG.guardPct
-			and now > (COMBAT_STATE.guardGraceUntil or 0) then
-			COMBAT_STATE.disengagedAt = now
+			and os.clock() > (COMBAT_STATE.guardGraceUntil or 0) then
+			COMBAT_STATE.disengagedAt = os.clock()
 			COMBAT_STATE.disengaged = true
 			local near = liveMobs(CFG.auraRange * 3, 1)[1]
 			if CFG.retreat and near then retreatFrom(near.model) end
@@ -1699,13 +2234,13 @@ loop(0.03, function()
 		elseif COMBAT_STATE.disengaged
 			and (pct >= CFG.resumePct
 				or (CFG.resumeAfter > 0
-					and now - (COMBAT_STATE.disengagedAt or 0) > CFG.resumeAfter)) then
+					and os.clock() - (COMBAT_STATE.disengagedAt or 0) > CFG.resumeAfter)) then
 			COMBAT_STATE.disengaged = false
 			-- Timed resumes happen when health has NOT recovered, so without a
 			-- grace period it would disengage again on the very next tick and
 			-- nothing would ever be hit. This gives it a window to actually fight.
 			if pct < CFG.resumePct then
-				COMBAT_STATE.guardGraceUntil = now + math.max(CFG.resumeAfter * 0.5, 4)
+				COMBAT_STATE.guardGraceUntil = os.clock() + math.max(CFG.resumeAfter * 0.5, 4)
 			end
 			COMBAT_STATE.status = "re-engaged"
 			pcall(function()
@@ -1718,8 +2253,8 @@ loop(0.03, function()
 		end
 	end
 
-	-- stamina: swinging into an empty bar leaves nothing to block or parry with.
-	-- Reuse cached `c` instead of calling character() again.
+	-- stamina: swinging into an empty bar leaves nothing to block or parry with
+	local c = character()
 	if c and CFG.staminaFloor > 0 then
 		local st = tonumber(c:GetAttribute("Stamina"))
 		if st and st < CFG.staminaFloor then
@@ -1737,10 +2272,16 @@ loop(0.03, function()
 	-- hit. It now sits below target selection, so fighting a player can use its
 	-- own rate — and so farm seeking still runs on a tick the rate never blocks.
 
-	-- Everything inside the circle, or only what the farm filters allow
+	-- Everything inside the circle, or only what the farm filters allow.
+	--
+	-- "Hit everything in range" now means EVERYTHING. It used to still apply the
+	-- farm's mob-name filter, which is how a filter left on "Ice Wasp" made the
+	-- aura silently ignore all fourteen Evil Snowmen standing on top of you —
+	-- the toggle said one thing and did another. The filter is for CHOOSING what
+	-- to walk to; it has no business deciding what you hit back.
 	local targets, vetoed
 	if CFG.hitAll then
-		targets = liveMobs(CFG.auraRange, CFG.auraTargets, FARM.types)
+		targets = liveMobs(CFG.auraRange, CFG.auraTargets)
 	else
 		targets, vetoed = pickMobs(CFG.auraRange, CFG.auraTargets)
 	end
@@ -1766,8 +2307,8 @@ loop(0.03, function()
 						WALK.label or "", math.floor(walkDistance() or 0))
 				return
 			end
-			if now - FARM.lastSeek >= FARM.seekWait then
-				FARM.lastSeek = now
+			if os.clock() - FARM.lastSeek >= FARM.seekWait then
+				FARM.lastSeek = os.clock()
 				local list, vetoWhy = pickMobs(FARM.seekDist, 1)
 				local next_ = list[1]
 				if next_ then
@@ -1786,7 +2327,20 @@ loop(0.03, function()
 				return
 			end
 		end
-		COMBAT_STATE.status = "no target in range"
+		-- "no target in range" is a lie when there are mobs all round you and a
+		-- filter or a veto is quietly dropping them. Say which, so a setting left
+		-- on from an hour ago cannot masquerade as a broken aura.
+		local raw = liveMobs(CFG.auraRange, 32)
+		if #raw > 0 then
+			local why = "a filter"
+			if not CFG.hitAll then
+				local _, vetoWhy = pickMobs(CFG.auraRange, 32)
+				why = vetoWhy and ("Survival veto: " .. vetoWhy) or "the mob filter"
+			end
+			COMBAT_STATE.status = ("%d in range but skipped — %s"):format(#raw, why)
+		else
+			COMBAT_STATE.status = "no target in range"
+		end
 		return
 	end
 	-- Is a player in this list? If so the PvP settings take over.
@@ -1803,7 +2357,7 @@ loop(0.03, function()
 
 	local interval = CFG.auraInterval
 	if COMBAT_STATE.vsPlayer then interval = PVP.interval end
-	if not CFG.noCooldown and now - COMBAT_STATE.lastHit < interval then return end
+	if not CFG.noCooldown and os.clock() - COMBAT_STATE.lastHit < interval then return end
 
 	-- IN REACH — but reach means the SERVER'S reach, not the aura slider's.
 	-- CombatConfig.MAX_HIT_DISTANCE is 15. The aura range goes to 40, and this
@@ -1823,13 +2377,13 @@ loop(0.03, function()
 	-- Abilities, aimed at the player we are fighting. These go out on their own
 	-- remote and do not consume the swing, so they stack on top of it.
 	if vsPlayer and PVP.useSkills and playerPos
-		and now - PVP.lastSkill >= PVP.skillInterval then
-		PVP.lastSkill = now
+		and os.clock() - PVP.lastSkill >= PVP.skillInterval then
+		PVP.lastSkill = os.clock()
 		local okCast, which = castSkill(playerPos)
 		if okCast then COMBAT_STATE.status = "cast " .. tostring(which) end
 	end
 
-	COMBAT_STATE.lastHit = now
+	COMBAT_STATE.lastHit = os.clock()
 	swingAt(targets)
 end)
 
@@ -2141,6 +2695,205 @@ SESSION.World = WORLD   -- here, not in the exposure block above: WORLD is
                         -- would quietly store nil.
 
 ----------------------------------------------------------------------
+-- 6c. PLACE NAMES — the map's own labels, floated over the world
+----------------------------------------------------------------------
+-- The game names its own places; none of this is invented. Read off Floor 2:
+--   workspace.MapAnchors      Skalvik, Frosthaven, Eirholm   (the towns)
+--   Floor2.MobZones           SouthernRise_EvilSnowman_Lv25-26, and friends —
+--                             area, mob and level range all encoded in the name
+--   Floor2.MinibossArenas     RimecrownIsle, TyrantsHollow, SentinelGarrison
+--   Floor2.FishingSpots       FishingSpot_Frosthaven, ...
+--   Floor2.Lookouts           West/East/North
+--   Floor2.Dungeon / BossRoom with human names on their own prompts
+--
+-- The folder names are per-floor, so this looks for whichever FloorN exists
+-- rather than hard-coding Floor2.
+local PLACES = {
+	enabled  = false,
+	range    = 6000,
+	-- Each category is its own switch, so the mob-zone clutter can go without
+	-- taking the towns with it.
+	cats     = { Towns = true, Bosses = true },
+	colour   = Color3.fromRGB(255, 255, 255),
+	shown    = 0,
+	labels   = {},
+	maxLabels = 28,
+	lastScan = 0,
+	cache    = {},
+
+	-- Two tiers. A town and a boss room are landmarks you navigate by, so they
+	-- float well above the terrain and read from a distance; a fishing spot or
+	-- a lookout is detail and sits low, near the thing it names. Without this
+	-- everything hung at the same height and a town was indistinguishable from
+	-- a pond.
+	majorHeight = 70,
+	minorHeight = 18,
+	majorSize   = 20,
+	minorSize   = 13,
+}
+
+-- Which categories are landmarks rather than detail.
+local PLACE_MAJOR = { Towns = true, Bosses = true }
+
+-- "FrosthavenSouth_IceWasp_Lv21-22" reads badly floating over a hillside.
+local function prettyPlace(name)
+	-- "FishingSpot_Frosthaven" used to come out as plain "Frosthaven", which is
+	-- also the name of the TOWN — two labels reading the same thing a few
+	-- hundred studs apart. Keep the kind in the name.
+	local s = tostring(name)
+	local spot = s:match("^FishingSpot_(.+)$")
+	if spot then
+		s = spot .. "_Fishing"
+	end
+	s = s:gsub("_", " · ")
+	-- split camelCase, but leave runs of capitals and Lv21-22 alone
+	s = s:gsub("(%l)(%u)", "%1 %2")
+	return s
+end
+
+-- A Folder has no position of its own, so fall back to any BasePart under it.
+local function anyPosition(inst)
+	local ok, p = pcall(function()
+		if inst:IsA("BasePart") then return inst.Position end
+		if inst:IsA("Model") then return inst:GetPivot().Position end
+		return nil
+	end)
+	if ok and typeof(p) == "Vector3" then return p end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") then return d.Position end
+	end
+	-- MEASURED: the four miniboss arenas are Folders holding Models holding
+	-- nothing — their geometry is not streamed in until you are near. A part
+	-- search finds nothing, so all four were silently dropped. Their nested
+	-- Models still carry a real pivot, which is enough to put a label at.
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("Model") then
+			local okp, cf = pcall(function() return d:GetPivot() end)
+			if okp and cf and cf.Position.Magnitude > 1 then return cf.Position end
+		end
+	end
+	return nil
+end
+
+local function floorFolder()
+	for _, c in ipairs(workspace:GetChildren()) do
+		if c:IsA("Folder") and c.Name:match("^Floor%d+$") then return c end
+	end
+	return nil
+end
+
+-- Rebuilt rarely: these are static map features, not moving targets.
+local function scanPlaces()
+	local found = {}
+	local function add(cat, inst, label)
+		local p = anyPosition(inst)
+		if p then found[#found + 1] = { cat = cat, pos = p, text = label or prettyPlace(inst.Name) } end
+	end
+
+	local ma = workspace:FindFirstChild("MapAnchors")
+	if ma then
+		for _, c in ipairs(ma:GetChildren()) do add("Towns", c) end
+	end
+
+	local fl = floorFolder()
+	if fl then
+		local mz = fl:FindFirstChild("MobZones")
+		if mz then for _, c in ipairs(mz:GetChildren()) do add("Mob zones", c) end end
+		local ar = fl:FindFirstChild("MinibossArenas")
+		if ar then for _, c in ipairs(ar:GetChildren()) do add("Bosses", c) end end
+		local fs = fl:FindFirstChild("FishingSpots")
+		if fs then for _, c in ipairs(fs:GetChildren()) do add("Fishing", c) end end
+		local lo = fl:FindFirstChild("Lookouts")
+		if lo then for _, c in ipairs(lo:GetChildren()) do add("Lookouts", c) end end
+		for _, n in ipairs({ "Dungeon", "BossRoom" }) do
+			local d = fl:FindFirstChild(n)
+			if d then add("Bosses", d) end
+		end
+	end
+	PLACES.cache = found
+end
+
+local function releasePlaceLabels()
+	for _, rec in ipairs(PLACES.labels) do
+		rec.inUse = false
+		rec.gui.Enabled = false
+	end
+end
+
+loop(0.5, function()
+	if not SESSION.Alive then return end
+	if not PLACES.enabled then
+		if PLACES.shown > 0 then releasePlaceLabels() PLACES.shown = 0 end
+		return
+	end
+	local _, hrp = character()
+	if not hrp then return end
+
+	if os.clock() - PLACES.lastScan > 15 or #PLACES.cache == 0 then
+		PLACES.lastScan = os.clock()
+		scanPlaces()
+	end
+
+	releasePlaceLabels()
+	local list = {}
+	for _, pl in ipairs(PLACES.cache) do
+		if PLACES.cats[pl.cat] then
+			local d = (pl.pos - hrp.Position).Magnitude
+			if d <= PLACES.range then
+				list[#list + 1] = { pl = pl, dist = d }
+			end
+		end
+	end
+	table.sort(list, function(a, b) return a.dist < b.dist end)
+
+	local n = 0
+	for _, item in ipairs(list) do
+		if n >= PLACES.maxLabels then break end
+		local rec
+		for _, r in ipairs(PLACES.labels) do if not r.inUse then rec = r break end end
+		if not rec and #PLACES.labels < PLACES.maxLabels then
+			local gui = Instance.new("BillboardGui")
+			gui.Name = "PE_PlaceTag"
+			gui.AlwaysOnTop = true
+			gui.Size = UDim2.fromOffset(280, 26)
+			gui.Parent = workspace
+			track(gui)
+			local anchor = Instance.new("Part")
+			anchor.Name = "PE_PlaceAnchor"
+			anchor.Anchored, anchor.CanCollide, anchor.CanQuery, anchor.CanTouch = true, false, false, false
+			anchor.Transparency = 1
+			anchor.Size = Vector3.new(0.2, 0.2, 0.2)
+			anchor.Parent = workspace
+			track(anchor)
+			gui.Adornee = anchor
+			local txt = Instance.new("TextLabel")
+			txt.BackgroundTransparency = 1
+			txt.Size = UDim2.fromScale(1, 1)
+			txt.Font = Enum.Font.GothamBold
+			txt.TextStrokeTransparency = 0.3
+			txt.Parent = gui
+			rec = { gui = gui, txt = txt, anchor = anchor }
+			table.insert(PLACES.labels, rec)
+		end
+		if rec then
+			n = n + 1
+			local major = PLACE_MAJOR[item.pl.cat] == true
+			rec.inUse = true
+			rec.anchor.CFrame = CFrame.new(item.pl.pos
+				+ Vector3.new(0, major and PLACES.majorHeight or PLACES.minorHeight, 0))
+			rec.gui.Enabled = true
+			rec.txt.Text = ("%s  ·  %d"):format(item.pl.text, math.floor(item.dist))
+			rec.txt.TextColor3 = PLACES.colour
+			rec.txt.TextSize = major and PLACES.majorSize or PLACES.minorSize
+			rec.txt.Font = major and Enum.Font.GothamBold or Enum.Font.Gotham
+		end
+	end
+	PLACES.shown = n
+end)
+
+SESSION.Places = PLACES
+
+----------------------------------------------------------------------
 -- 7. VISUALS
 ----------------------------------------------------------------------
 -- Brightness and fog are SEPARATE here, because they are separate things in the
@@ -2264,13 +3017,34 @@ local DEF = {
 	-- auto parry. Combat is the same string-action bus the aura uses:
 	-- Client.Systems.Combat line 1053 fires Combat:FireServer("Parry", serverTime)
 	-- and gates itself on CombatConfig.block.parryCooldown.
-	-- Shared config says tapThreshold 0.15, parryWindow 0.4, parryCooldown 1.5.
+	-- Shared config says tapThreshold 0.15, parryWindow 0.4, parryCooldown 0.9.
+	--
+	-- THE COOLDOWN IS THE SERVER'S, not ours, and it cannot be removed. The
+	-- client gates itself on CombatConfig.block.parryCooldown in a local upvalue
+	-- (Combat:1326) which we bypass completely by firing the remote ourselves —
+	-- so it would be easy to assume spamming works. MEASURED: 70 parries fired
+	-- at 0.1s intervals over 7 seconds produced EIGHT server-side parries, with
+	-- gaps of 0.93, 0.93, 0.92, 1.14, 0.72, 0.93, 0.92. The server simply drops
+	-- the rest. Anything faster than ~0.9s is wasted traffic.
+	--
+	-- What was genuinely wrong here: this used to wait 1.5s, a number guessed
+	-- from an older reading of the config. The real figure is 0.9, so the parry
+	-- was firing at about two thirds of the rate the game actually allows.
 	parry = false,
 	parryLead = 0.20,    -- fire this long before the hit lands, into the 0.4s window
 	parryRange = 16,     -- do not parry something that cannot reach you
-	parryCooldown = 1.5,
+	parryCooldown = 0.9, -- overwritten from the game's own config on load
 	lastParry = 0,
 	parries = 0,
+
+	-- GUARD BETWEEN PARRIES. The cooldown cannot be shortened, so the answer to
+	-- "ten mobs around me" is to not stand there unprotected while it runs.
+	-- Holding Block cut damage from 42 to 4 over three hits when it was measured
+	-- in PvP, and it costs about 0.75 stamina a second, refunded on release.
+	-- Off by default: you cannot swing while guard is up.
+	guard      = false,
+	guardHeld  = false,
+	guardUntil = 0,
 
 	-- DASH on hits the game will not let you parry.
 	--
@@ -2304,8 +3078,15 @@ task.spawn(function()
 	if not node then return end
 	local ok, cfg = pcall(require, node)
 	if not (ok and type(cfg) == "table") then return end
-	if type(cfg.block) == "table" and tonumber(cfg.block.parryLevelGap) then
-		DEF.parryGap = tonumber(cfg.block.parryLevelGap)
+	if type(cfg.block) == "table" then
+		if tonumber(cfg.block.parryLevelGap) then
+			DEF.parryGap = tonumber(cfg.block.parryLevelGap)
+		end
+		-- take the cooldown from the game instead of a number typed in here,
+		-- which is how it ended up 1.5 when the real value is 0.9
+		if tonumber(cfg.block.parryCooldown) then
+			DEF.parryCooldown = tonumber(cfg.block.parryCooldown)
+		end
 	end
 	if type(cfg.dash) == "table" then
 		DEF.dashCooldown = tonumber(cfg.dash.cooldown) or DEF.dashCooldown
@@ -2429,10 +3210,14 @@ local function handleTelegraph(info)
 				-- drains stamina at CombatConfig.block.staminaDrainPerSecond.
 				-- Measured: a parry test left Blocking=true and stamina at 18/100.
 				-- The game's own code releases with Combat:FireServer("Block", false).
-				task.delay(0.35, function()
-					if not SESSION.Alive then return end
-					pcall(function() Combat:FireServer("Block", false) end)
-				end)
+				-- With Hold guard on we deliberately do NOT release: the block is
+				-- what covers the cooldown, and the guard loop owns it from here.
+				if not DEF.guard then
+					task.delay(0.35, function()
+						if not SESSION.Alive then return end
+						pcall(function() Combat:FireServer("Block", false) end)
+					end)
+				end
 			end)
 			return
 		end
@@ -2453,6 +3238,74 @@ local function handleTelegraph(info)
 		end
 	end
 end
+
+-- HOLD GUARD BETWEEN PARRIES.
+--
+-- The parry cooldown is the server's and cannot be shortened — 70 parries fired
+-- at 0.1s produced 8, spaced 0.93s. So the way to survive a pack is to spend the
+-- gap blocking rather than standing in it.
+--
+-- Block is a HELD input, not a latch: the configuration that actually set
+-- Blocking server-side re-sent it about every 0.4s, and a single fire did not
+-- take. It also needs a weapon out, and it stops you swinging — which is why
+-- this is a toggle and not always on.
+local DEF_GUARD_PING = 0.4
+local defGuardPinged = 0
+
+local function setDefGuard(on)
+	on = on and true or false
+	if DEF.guardHeld == on then
+		if on then
+			-- MEASURED against a wasp pack: a hit knocks the guard down
+			-- server-side, and the seconds where Blocking had lapsed cost 215,
+			-- 215 and 208 HP against 86, 43 and 28 for the seconds where it was
+			-- actually up. Re-pinging on a fixed 0.4s timer left those gaps
+			-- open, so re-assert the INSTANT the attribute is not true and fall
+			-- back to the timer only while it is holding.
+			local c = character()
+			local reallyUp = c and c:GetAttribute("Blocking") == true
+			if not reallyUp or os.clock() - defGuardPinged >= DEF_GUARD_PING then
+				defGuardPinged = os.clock()
+				pcall(function() Combat:FireServer("Block", true) end)
+			end
+		end
+		return
+	end
+	DEF.guardHeld = on
+	SESSION.DefGuard.held = on      -- so swingAt can see it without reaching forward
+	if on then SESSION.DefGuard.raisedAt = os.clock() end
+	defGuardPinged = os.clock()
+	pcall(function() Combat:FireServer("Block", on) end)
+end
+DEF.setGuard = setDefGuard
+SESSION.DefGuard.setGuard = setDefGuard
+
+loop(0.15, function()
+	if not SESSION.Alive then return end
+	if not DEF.guard then
+		setDefGuard(false)
+		return
+	end
+	-- A swing is in flight: stay down until its window closes, then resume.
+	if os.clock() < (SESSION.DefGuard.yieldUntil or 0) then
+		setDefGuard(false)
+		return
+	end
+
+	local c, hrp = character()
+	-- the server refuses Block with no weapon in hand, so do not pretend
+	if not (c and hrp) or c:GetAttribute("WeaponType") == nil then
+		setDefGuard(false)
+		return
+	end
+	-- only while something is actually close enough to hit you
+	local near = liveMobs(DEF.parryRange + 4, 1)[1]
+	setDefGuard(near ~= nil)
+end)
+
+table.insert(SESSION.Restore, function()
+	pcall(function() Combat:FireServer("Block", false) end)
+end)
 
 SESSION.Def = DEF
 SESSION.Pvp = PVP
@@ -2652,14 +3505,18 @@ local function oreNodes(maxDist, limit, filter)
 		end
 	end
 	table.sort(out, function(a, b) return a.dist < b.dist end)
-	local lim = limit or 8
-	if #out > lim then for i = lim + 1, #out do out[i] = nil end end
+	while #out > (limit or 8) do table.remove(out) end
 	return out
 end
 
--- the aura: swing at whatever is already in reach
+-- The aura: swing at whatever is already in reach.
+--
+-- Auto mine drives this too. It used to only TRAVEL, and relied on the aura
+-- toggle being switched on separately to do the hitting — so turning on just
+-- "Auto mine" walked you to a node and left you standing in front of it doing
+-- nothing, which looks exactly like a broken feature. One toggle is enough now.
 loop(0.15, function()
-	if not (SESSION.Alive and MINE.enabled) then return end
+	if not (SESSION.Alive and (MINE.enabled or MINE.auto)) then return end
 	if os.clock() - MINE.last < MINE.interval then return end
 	local t = oreNodes(MINE.range, 1, MINE.types)[1]
 	if not t then return end
@@ -2702,6 +3559,9 @@ loop(0.35, function()
 	-- Is the node we are walking to still worth walking to?
 	local t = MINE.target
 	if t and (not t.Parent or t:GetAttribute("MinedOut") == true or not t:FindFirstChild("Ore")) then
+		-- It is gone, so that is one node actually mined. The counter used to be
+		-- bumped when a node was PICKED instead, which counted walking, not ore.
+		MINE.mined = MINE.mined + 1
 		MINE.target = nil
 		t = nil
 		if WALK.label == MINE_LABEL then pcall(walkStop) end
@@ -2744,7 +3604,6 @@ loop(0.35, function()
 		return
 	end
 	MINE.target = next1.node
-	MINE.mined = MINE.mined + 1
 	walkTo(next1.pos, MINE_LABEL)
 	MINE.status = ("walking to %s (%d studs)"):format(next1.ore, math.floor(next1.dist))
 end)
@@ -3192,11 +4051,14 @@ end)
 -- which is the one place a write sticks.
 local CURSOR = { enabled = true, bound = false }
 
+-- Raven tracks this as Window.Opened. The old library exposed it as a Signal
+-- object you called GetValue on, and that is what this read -- so after the UI
+-- port it always came back false, the cursor was never freed, and opening the
+-- menu left you with no mouse to click it with.
 local function menuIsOpen()
-	local w = SESSION.Window
-	if not (w and w.Signal) then return false end
-	local ok, v = pcall(w.Signal.GetValue, w.Signal)
-	return ok and v == true
+	local L = SESSION.Library
+	local w = L and L.Windows and L.Windows[1]
+	return (w ~= nil) and (w.Opened == true)
 end
 
 local function cursorStep()
@@ -3408,8 +4270,13 @@ loop(1.5, function()
 	if dead and os.clock() - MISC.lastRespawn > 6 then
 		MISC.lastRespawn = os.clock()
 		MISC.respawns = MISC.respawns + 1
-		pcall(function() Remotes.RequestRespawn:FireServer() end)
-		Logging.new("crop", "Respawn requested", 5)
+		-- ALWAYS false, never nil. The server reads this argument as
+		-- "RespawnNoPenalty", and that is the PAID option in this game
+		-- (RemakeConfig.NO_PENALTY_PRODUCT_ID = 1570932347 is set here).
+		-- Sending no argument relied on the server treating nil as falsy;
+		-- false says it outright and can never cost Robux.
+		pcall(function() Remotes.RequestRespawn:FireServer(false) end)
+		Logging.new("crop", "Respawn requested (free)", 5)
 	end
 end)
 
@@ -3452,6 +4319,757 @@ loop(0.5, function()
 	end
 end)
 
+----------------------------------------------------------------------
+-- 9b. QUEST TRAIL AND QUEST ESP
+----------------------------------------------------------------------
+-- WHAT THE CLIENT ACTUALLY KNOWS, checked rather than assumed. The quest
+-- definitions live on the SERVER: grepping all 483 client scripts for a real
+-- quest id (floor2SnowmanQuest) returns nothing. All the client is handed is
+-- State.get().story.tracker, and QuestTracker:134 shows a step is only ever
+--     { text = "Defeat Evil Snowman", have = 3, need = 15 }
+-- There is no mob reference and no coordinate anywhere in it.
+--
+-- So the target has to be recovered from that English sentence, by matching the
+-- words against what is actually spawned. That works well for kill objectives,
+-- because the text carries the mob's DisplayName verbatim. It CANNOT work for
+-- "Travel to Floor 2" — there is no position client-side to point at, and the
+-- UI says so rather than drawing a trail to nowhere.
+local QUEST = {
+	esp       = false,
+	trail     = false,
+	objective = "",
+	have      = 0,
+	need      = 0,
+	matchName = nil,     -- the mob Name we think the quest wants
+	targets   = 0,
+	note      = "no quest tracked",
+	colour    = Color3.fromRGB(255, 225, 120),
+	trailParts = {},
+	lastPath  = 0,
+}
+
+-- "Clear the Snow Apes off the north road" was the objective that showed this
+-- list was too short — it is a kill objective and none of the first six verbs
+-- appear in it.
+local QUEST_VERBS = {
+	"defeat", "kill", "slay", "hunt", "destroy", "eliminate",
+	"clear", "cull", "thin", "drive off", "wipe", "exterminate",
+}
+
+local function normalise(s)
+	return (tostring(s):lower():gsub("[^%a]", ""))
+end
+
+-- Pull the live objective out of the tracker.
+local function readQuest()
+	local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+	local node = scripts and scripts:FindFirstChild("State", true)
+	if not node then return nil end
+	local ok, State = pcall(require, node)
+	if not (ok and type(State) == "table" and State.get) then return nil end
+	local ok2, d = pcall(State.get)
+	if not (ok2 and type(d) == "table") then return nil end
+
+	-- WHICH tracker is the live one is not obvious. There is a story table per
+	-- floor — story, story2, and presumably more later — and the finished ones
+	-- keep their last tracker forever. Reading d.story gave "Travel to Floor 2"
+	-- while the screen showed a Floor 2 quest, because floor 1's tracker was
+	-- stale. So collect every candidate and take one that still has work in it,
+	-- newest floor first.
+	local cands = {}
+	if type(d.quests) == "table" and type(d.quests.active) == "table" then
+		cands[#cands + 1] = d.quests.active.tracker or d.quests.active
+	end
+	local storyKeys = {}
+	for k, v in pairs(d) do
+		if type(v) == "table" and type(k) == "string" and k:match("^story%d*$") then
+			storyKeys[#storyKeys + 1] = k
+		end
+	end
+	-- "story9" before "story2" before "story"
+	table.sort(storyKeys, function(a, b)
+		return (tonumber(a:match("%d+")) or 0) > (tonumber(b:match("%d+")) or 0)
+	end)
+	for _, k in ipairs(storyKeys) do
+		if type(d[k].tracker) == "table" then cands[#cands + 1] = d[k].tracker end
+	end
+
+	local tr = nil
+	for _, c in ipairs(cands) do
+		if c.complete ~= true then
+			-- does it actually have an unfinished step?
+			local open = false
+			if type(c.steps) == "table" then
+				for _, s in ipairs(c.steps) do
+					if type(s) == "table" and (tonumber(s.have) or 0) < (tonumber(s.need) or 1) then
+						open = true
+						break
+					end
+				end
+			else
+				open = true
+			end
+			if open then tr = c break end
+		end
+	end
+	tr = tr or cands[1]
+	if type(tr) ~= "table" then return nil end
+
+	local step = nil
+	if type(tr.steps) == "table" then
+		for _, s in ipairs(tr.steps) do
+			-- first unfinished step is the one you are being asked to do
+			if type(s) == "table" and (tonumber(s.have) or 0) < (tonumber(s.need) or 1) then
+				step = s
+				break
+			end
+		end
+		step = step or tr.steps[1]
+	end
+	if not step then
+		step = { text = tr.objective or tr.name, have = tr.progress, need = tr.goal }
+	end
+	return {
+		name = tostring(tr.name or "Quest"),
+		text = tostring(step.text or tr.name or "Objective"),
+		have = tonumber(step.have) or 0,
+		need = math.max(1, tonumber(step.need) or 1),
+	}
+end
+
+-- Match the objective sentence against what is spawned. Compared on letters
+-- only, so "Evil Snowman" finds EvilSnowman and "Corrupted Ice Wasp" finds
+-- IceWasp by its MobKind.
+local function matchQuestMob(text)
+	local folder = workspace:FindFirstChild("Mobs")
+	if not folder then return nil end
+	local hay = normalise(text)
+	local isKill = false
+	for _, v in ipairs(QUEST_VERBS) do
+		if hay:find(v, 1, true) then isKill = true break end
+	end
+	if not isKill then return nil, false end
+
+	local best, bestLen = nil, 0
+	local seen = {}
+	for _, m in ipairs(folder:GetChildren()) do
+		if not seen[m.Name] then
+			seen[m.Name] = true
+			for _, cand in ipairs({ m:GetAttribute("DisplayName"), m:GetAttribute("MobKind"), m.Name }) do
+				if cand then
+					local n = normalise(cand)
+					-- longest match wins, so "Ice Wasp" beats "Wasp"
+					if #n > 2 and hay:find(n, 1, true) and #n > bestLen then
+						best, bestLen = m.Name, #n
+					end
+				end
+			end
+		end
+	end
+	return best, true
+end
+
+local function clearTrail()
+	for _, p in ipairs(QUEST.trailParts) do pcall(function() p:Destroy() end) end
+	QUEST.trailParts = {}
+end
+table.insert(SESSION.Restore, clearTrail)
+
+-- The trail itself: the same PathfindingService route the walker would take,
+-- laid out as markers on the ground. Not a straight line — a straight line
+-- through a mountain is worse than no trail at all.
+local function drawTrail(toPos)
+	clearTrail()
+	local _, hrp = character()
+	if not hrp then return end
+	-- MEASURED: this drew nothing at all against Ice Wasps, because they FLY.
+	-- A destination up in the air is not on the navmesh, so ComputeAsync never
+	-- returns Success and the trail silently never appeared. Drop the target
+	-- onto the ground underneath it first, exactly as the mob chase has to.
+	toPos = groundPoint(toPos)
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 3, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8,
+	})
+	local okc = pcall(function() path:ComputeAsync(hrp.Position, toPos) end)
+	if not (okc and path.Status == Enum.PathStatus.Success) then
+		QUEST.note = QUEST.note .. " (no route)"
+		return
+	end
+	for i, wp in ipairs(path:GetWaypoints()) do
+		if i % 2 == 0 then                      -- every other node is plenty
+			local p = Instance.new("Part")
+			p.Name = "PE_QuestTrail"
+			p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch = true, false, false, false
+			p.CastShadow = false
+			p.Material = Enum.Material.Neon
+			p.Color = QUEST.colour
+			p.Transparency = 0.3
+			p.Size = Vector3.new(1.2, 0.1, 1.2)
+			p.CFrame = CFrame.new(wp.Position + Vector3.new(0, 0.1, 0))
+			p.Parent = workspace
+			track(p)
+			table.insert(QUEST.trailParts, p)
+		end
+	end
+end
+
+local questLabels = {}
+local function clearQuestLabels()
+	for _, rec in ipairs(questLabels) do
+		rec.inUse = false
+		rec.gui.Enabled = false
+		rec.gui.Adornee = nil
+	end
+end
+
+loop(1, function()
+	if not SESSION.Alive then return end
+	if not (QUEST.esp or QUEST.trail) then
+		if #QUEST.trailParts > 0 then clearTrail() end
+		clearQuestLabels()
+		return
+	end
+
+	local q = readQuest()
+	if not q then
+		QUEST.note = "no quest tracked"
+		QUEST.objective, QUEST.targets = "", 0
+		clearTrail() clearQuestLabels()
+		return
+	end
+	QUEST.objective, QUEST.have, QUEST.need = q.text, q.have, q.need
+
+	local name, isKill = matchQuestMob(q.text)
+	QUEST.matchName = name
+	if not isKill then
+		-- "Travel to Floor 2" and friends: no coordinate exists client-side
+		QUEST.note = "objective is not a kill — nothing to point at"
+		QUEST.targets = 0
+		clearTrail() clearQuestLabels()
+		return
+	end
+	if not name then
+		QUEST.note = "target not spawned near you"
+		QUEST.targets = 0
+		clearTrail() clearQuestLabels()
+		return
+	end
+
+	local list = liveMobs(math.huge, 24, { [name] = true })
+	QUEST.targets = #list
+	QUEST.note = ("%s — %d/%d, %d nearby"):format(name, q.have, q.need, #list)
+
+	clearQuestLabels()
+	if QUEST.esp then
+		for i, t in ipairs(list) do
+			if i > 12 then break end
+			local rec
+			for _, r in ipairs(questLabels) do if not r.inUse then rec = r break end end
+			if not rec and #questLabels < 12 then
+				local gui = Instance.new("BillboardGui")
+				gui.Name = "PE_QuestTag"
+				gui.AlwaysOnTop = true
+				gui.Size = UDim2.fromOffset(200, 20)
+				gui.StudsOffsetWorldSpace = Vector3.new(0, 4, 0)
+				gui.Parent = workspace
+				track(gui)
+				local txt = Instance.new("TextLabel")
+				txt.BackgroundTransparency = 1
+				txt.Size = UDim2.fromScale(1, 1)
+				txt.Font = Enum.Font.GothamBold
+				txt.TextSize = 13
+				txt.TextStrokeTransparency = 0.4
+				txt.Parent = gui
+				rec = { gui = gui, txt = txt }
+				table.insert(questLabels, rec)
+			end
+			if rec then
+				rec.inUse = true
+				rec.gui.Adornee = t.model:FindFirstChild("HumanoidRootPart")
+					or t.model.PrimaryPart or t.model:FindFirstChildWhichIsA("BasePart")
+				rec.gui.Enabled = rec.gui.Adornee ~= nil
+				rec.txt.Text = ("QUEST  %d"):format(math.floor(t.dist))
+				rec.txt.TextColor3 = QUEST.colour
+			end
+		end
+	end
+
+	if QUEST.trail and list[1] and os.clock() - QUEST.lastPath > 3 then
+		QUEST.lastPath = os.clock()
+		drawTrail(list[1].model:GetPivot().Position)
+	elseif not QUEST.trail and #QUEST.trailParts > 0 then
+		clearTrail()
+	end
+end)
+
+SESSION.Quest = QUEST
+
+----------------------------------------------------------------------
+-- 9c. INFO BOX — a movable overlay that outlives the menu
+----------------------------------------------------------------------
+-- It gets its OWN ScreenGui, not a frame inside the menu's. That is the whole
+-- point: closing the menu must not take it with it, and the menu's unload
+-- destroys everything parented under its own gui.
+local INFO = {
+	enabled  = false,
+	fields   = {},        -- set of category names the filter picked
+	width    = 260,
+	height   = 190,
+	textSize = 13,
+
+	-- Everything about how it looks is a setting. The first version was one
+	-- TextLabel with newlines and hand-spaced columns, which is exactly why it
+	-- read as sloppy: nothing lined up and nothing could be changed.
+	bg        = Color3.fromRGB(16, 17, 22),
+	bgAlpha   = 0.08,
+	heading   = Color3.fromRGB(120, 170, 255),
+	key       = Color3.fromRGB(150, 156, 178),
+	value     = Color3.fromRGB(240, 243, 252),
+	border    = Color3.fromRGB(62, 66, 84),
+	titleCol  = Color3.fromRGB(235, 238, 248),
+	corner    = 10,
+	showTitle = true,
+	showBorder = true,
+	title     = "Project Eternity",
+
+	gui = nil, frame = nil, list = nil, titleLbl = nil, rows = {},
+}
+
+-- Each category is a function returning its own lines, so the filter just
+-- picks which of these run. Everything is read live from the character and
+-- State, nothing is cached and allowed to go stale.
+-- Each builder returns { label, value } pairs, NOT pre-formatted strings. That
+-- is what lets the box lay them out in two aligned columns instead of relying
+-- on hand-counted spaces, which never line up once the values change width.
+local INFO_FIELDS = {
+	{ key = "Sword", build = function(c)
+		if not c then return {} end
+		return {
+			{ "Weapon", tostring(c:GetAttribute("WeaponKind") or "—") },
+			{ "Damage", tostring(c:GetAttribute("WeaponDamage") or "—") },
+			{ "Type",   tostring(c:GetAttribute("WeaponType") or "—") },
+			{ "Drawn",  c:GetAttribute("Sheathed") == false and "yes" or "no" },
+		}
+	end },
+	{ key = "Armor", build = function(c)
+		if not c then return {} end
+		return {
+			{ "Armour",  tostring(c:GetAttribute("ArmorHealth") or "—") },
+			{ "Defense", tostring(c:GetAttribute("Defense") or "—") },
+			{ "Speed",   tostring(c:GetAttribute("ArmorSpeed") or "—") },
+			{ "Shield",  tostring(c:GetAttribute("HasShield") == true) },
+		}
+	end },
+	{ key = "Status", build = function(c)
+		if not c then return {} end
+		local hum = c:FindFirstChildOfClass("Humanoid")
+		local st  = tonumber(c:GetAttribute("Stamina")) or 0
+		local mx  = tonumber(c:GetAttribute("MaxStamina")) or 1
+		return {
+			{ "HP",       ("%d / %d"):format(hum and hum.Health or 0, hum and hum.MaxHealth or 0) },
+			{ "Stamina",  ("%d / %d"):format(st, mx) },
+			{ "Level",    tostring(LocalPlayer:GetAttribute("Level") or "—") },
+			{ "Blocking", tostring(c:GetAttribute("Blocking") == true) },
+		}
+	end },
+	{ key = "Combat stats", build = function()
+		local ratio = COMBAT_STATE.hits > 0
+			and math.floor(COMBAT_STATE.landed / COMBAT_STATE.hits * 100) or 0
+		return {
+			{ "Swings",  tostring(COMBAT_STATE.hits) },
+			{ "Landed",  ("%d (%d%%)"):format(COMBAT_STATE.landed, ratio) },
+			{ "Kills",   tostring(FARM.kills) },
+			{ "Parried", tostring(DEF.parries) },
+		}
+	end },
+	{ key = "Quest", build = function()
+		return {
+			{ "Objective", QUEST.objective ~= "" and QUEST.objective or "—" },
+			{ "Progress",  ("%d / %d"):format(QUEST.have, QUEST.need) },
+			{ "Nearby",    tostring(QUEST.targets) },
+		}
+	end },
+	{ key = "Position", build = function(c)
+		local hrp = c and c:FindFirstChild("HumanoidRootPart")
+		if not hrp then return { { "Position", "—" } } end
+		return {
+			{ "X / Z", ("%d, %d"):format(hrp.Position.X, hrp.Position.Z) },
+			{ "Y",     ("%d"):format(hrp.Position.Y) },
+			{ "Place", tostring(game.PlaceId) },
+		}
+	end },
+	{ key = "Mining", build = function()
+		return {
+			{ "Tier",   tostring(MINE.myTier()) },
+			{ "Nodes",  tostring(MINE.mined) },
+			{ "Swings", tostring(MINE.swings) },
+		}
+	end },
+}
+
+local function destroyInfo()
+	if INFO.gui then pcall(function() INFO.gui:Destroy() end) end
+	INFO.gui, INFO.frame, INFO.label = nil, nil, nil
+end
+table.insert(SESSION.Restore, destroyInfo)
+
+local function buildInfo()
+	if INFO.gui then return end
+	local parent = (type(gethui) == "function") and gethui() or game:GetService("CoreGui")
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "PE_InfoBox"
+	gui.ResetOnSpawn = false          -- survives dying, not just the menu closing
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999
+	gui.Parent = parent
+	track(gui)
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.fromOffset(INFO.width, INFO.height)
+	frame.Position = UDim2.fromOffset(40, 220)
+	frame.BackgroundColor3 = Color3.fromRGB(18, 19, 24)
+	frame.BackgroundTransparency = 0.15
+	frame.BorderSizePixel = 0
+	frame.Active = true               -- needed for input to reach it
+	frame.Parent = gui
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = frame
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(70, 74, 92)
+	stroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, -24, 0, 22)
+	title.Position = UDim2.fromOffset(12, 8)
+	title.BackgroundTransparency = 1
+	title.Text = INFO.title
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 13
+	title.TextColor3 = INFO.titleCol
+	title.Parent = frame
+
+	local rule = Instance.new("Frame")
+	rule.Name = "Rule"
+	rule.Size = UDim2.new(1, -24, 0, 1)
+	rule.Position = UDim2.fromOffset(12, 32)
+	rule.BorderSizePixel = 0
+	rule.BackgroundColor3 = INFO.border
+	rule.Parent = frame
+
+	-- A scrolling list, so picking seven categories does not spill off the box.
+	local list = Instance.new("ScrollingFrame")
+	list.Name = "List"
+	list.Position = UDim2.fromOffset(12, 40)
+	list.Size = UDim2.new(1, -24, 1, -50)
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 3
+	list.ScrollBarImageColor3 = INFO.border
+	list.CanvasSize = UDim2.new()
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = frame
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 2)
+	layout.Parent = list
+
+	INFO.titleLbl, INFO.rule, INFO.list = title, rule, list
+
+	-- Dragging by hand rather than frame.Draggable, which Roblox deprecated and
+	-- which ignores touch.
+	local dragging, dragStart, startPos
+	hold(frame.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1
+			or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = i.Position
+			startPos = frame.Position
+		end
+	end))
+	hold(frame.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1
+			or i.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+	hold(UserInputService.InputChanged:Connect(function(i)
+		if not dragging then return end
+		if i.UserInputType == Enum.UserInputType.MouseMovement
+			or i.UserInputType == Enum.UserInputType.Touch then
+			local delta = i.Position - dragStart
+			frame.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end))
+
+	INFO.gui, INFO.frame = gui, frame
+end
+
+-- Rows are pooled. Rebuilding the whole list every 0.4s would churn instances
+-- and make the scroll position jump under you.
+local function infoRow(i)
+	local rec = INFO.rows[i]
+	if rec then return rec end
+	local holder = Instance.new("Frame")
+	holder.BackgroundTransparency = 1
+	holder.Size = UDim2.new(1, 0, 0, 16)
+	holder.LayoutOrder = i
+	holder.Parent = INFO.list
+
+	local k = Instance.new("TextLabel")
+	k.BackgroundTransparency = 1
+	k.Size = UDim2.new(0.45, 0, 1, 0)
+	k.Font = Enum.Font.Gotham
+	k.TextXAlignment = Enum.TextXAlignment.Left
+	k.Parent = holder
+
+	local v = Instance.new("TextLabel")
+	v.BackgroundTransparency = 1
+	v.Size = UDim2.new(0.55, 0, 1, 0)
+	v.Position = UDim2.fromScale(0.45, 0)
+	v.Font = Enum.Font.GothamMedium
+	v.TextXAlignment = Enum.TextXAlignment.Right
+	v.TextTruncate = Enum.TextTruncate.AtEnd
+	v.Parent = holder
+
+	rec = { holder = holder, k = k, v = v }
+	INFO.rows[i] = rec
+	return rec
+end
+
+loop(0.4, function()
+	if not SESSION.Alive then return end
+	if not INFO.enabled then
+		if INFO.gui then INFO.gui.Enabled = false end
+		return
+	end
+	buildInfo()
+	if not INFO.gui then return end
+	INFO.gui.Enabled = true
+
+	-- live restyle, so every Customize control takes effect at once
+	local f = INFO.frame
+	f.Size = UDim2.fromOffset(INFO.width, INFO.height)
+	f.BackgroundColor3 = INFO.bg
+	f.BackgroundTransparency = INFO.bgAlpha
+	local corner = f:FindFirstChildOfClass("UICorner")
+	if corner then corner.CornerRadius = UDim.new(0, INFO.corner) end
+	local stroke = f:FindFirstChildOfClass("UIStroke")
+	if stroke then
+		stroke.Color = INFO.border
+		stroke.Transparency = INFO.showBorder and 0 or 1
+	end
+	INFO.titleLbl.Visible = INFO.showTitle
+	INFO.titleLbl.Text = INFO.title
+	INFO.titleLbl.TextColor3 = INFO.titleCol
+	INFO.rule.Visible = INFO.showTitle
+	INFO.rule.BackgroundColor3 = INFO.border
+	INFO.list.Position = UDim2.fromOffset(12, INFO.showTitle and 40 or 12)
+	INFO.list.Size = UDim2.new(1, -24, 1, INFO.showTitle and -50 or -22)
+	INFO.list.ScrollBarImageColor3 = INFO.border
+
+	local c = character()
+	local n = 0
+	local function put(label, value, isHeading)
+		n = n + 1
+		local rec = infoRow(n)
+		rec.holder.LayoutOrder = n
+		rec.holder.Size = UDim2.new(1, 0, 0, isHeading and (INFO.textSize + 8) or (INFO.textSize + 3))
+		rec.holder.Visible = true
+		rec.k.Text = label
+		rec.k.TextSize = isHeading and (INFO.textSize - 1) or INFO.textSize
+		rec.k.TextColor3 = isHeading and INFO.heading or INFO.key
+		rec.k.Font = isHeading and Enum.Font.GothamBold or Enum.Font.Gotham
+		rec.k.Size = UDim2.new(isHeading and 1 or 0.45, 0, 1, 0)
+		rec.v.Text = value or ""
+		rec.v.TextSize = INFO.textSize
+		rec.v.TextColor3 = INFO.value
+		rec.v.Visible = not isHeading
+	end
+
+	local any = false
+	for _, fld in ipairs(INFO_FIELDS) do
+		if INFO.fields[fld.key] then
+			any = true
+			put(fld.key:upper(), nil, true)
+			local ok, rows = pcall(fld.build, c)
+			if ok and type(rows) == "table" then
+				for _, r in ipairs(rows) do put(tostring(r[1]), tostring(r[2]), false) end
+			end
+		end
+	end
+	if not any then
+		put("NOTHING PICKED", nil, true)
+		put("Choose fields in", "Customize", false)
+	end
+	-- hide the tail of the pool rather than destroying it
+	for i = n + 1, #INFO.rows do INFO.rows[i].holder.Visible = false end
+end)
+
+SESSION.Info = INFO
+
+----------------------------------------------------------------------
+-- 9d. MENU THEMING
+----------------------------------------------------------------------
+-- Raven has a real theme API: Library.Theme holds ~24 named tokens, and
+-- Library:SetTheme(partial) writes them and re-tints everything on screen. So
+-- the old approach here -- snapshot every instance's original colour, then
+-- repaint by matching literal RGB values -- is gone. It only existed because
+-- the previous library baked colours in at build time and had no way to change
+-- them afterwards.
+--
+-- The Customize tab still offers six roles rather than all 24 tokens, because
+-- six is what a person can actually reason about. Each role expands into the
+-- tokens it governs, with the lighter/darker steps derived so the depth
+-- hierarchy (sidebar < window < card < element) survives any colour chosen.
+local MENU = {
+	windowBg = Color3.fromRGB(26, 26, 26),
+	panel    = Color3.fromRGB(30, 30, 30),
+	input    = Color3.fromRGB(22, 22, 22),
+	accent   = Color3.fromRGB(226, 226, 226),
+	text     = Color3.fromRGB(236, 236, 236),
+	dim      = Color3.fromRGB(142, 142, 142),
+	snapshot = nil,
+}
+
+-- Nudge a colour toward black (f < 1) or white (f > 1), keeping its hue. Used
+-- for the derived steps so one picked colour yields a consistent set.
+local function shade(c, f)
+	if f <= 1 then
+		return Color3.new(c.R * f, c.G * f, c.B * f)
+	end
+	local t = math.min(f - 1, 1)
+	return Color3.new(
+		c.R + (1 - c.R) * t,
+		c.G + (1 - c.G) * t,
+		c.B + (1 - c.B) * t)
+end
+
+local function applyMenuTheme()
+	local L = SESSION.Library
+	if not L or type(L.SetTheme) ~= "function" then return end
+
+	-- Accent first: SetAccent also picks a readable AccentText for it, which is
+	-- the colour drawn ON TOP of accent fills. Choosing that by hand is how you
+	-- end up with white text on a white accent.
+	pcall(function() L:SetAccent(MENU.accent) end)
+
+	pcall(function()
+		L:SetTheme({
+			Background    = MENU.windowBg,
+			Sidebar       = shade(MENU.windowBg, 0.73),
+			Widget        = shade(MENU.windowBg, 0.8),
+			Popup         = shade(MENU.windowBg, 0.92),
+
+			Card          = MENU.panel,
+			CardStroke    = shade(MENU.panel, 1.15),
+			Element       = shade(MENU.panel, 1.08),
+			ElementHover  = shade(MENU.panel, 1.2),
+			ElementStroke = shade(MENU.panel, 1.25),
+			Divider       = shade(MENU.panel, 1.1),
+			Checkbox      = shade(MENU.panel, 1.12),
+			Track         = shade(MENU.panel, 1.3),
+			Knob          = MENU.dim,
+
+			Field         = MENU.input,
+
+			Text          = MENU.text,
+			Outline       = MENU.text,
+			TextMuted     = MENU.dim,
+			TextDim       = shade(MENU.dim, 0.8),
+			TextFaint     = shade(MENU.dim, 0.6),
+		})
+	end)
+end
+MENU.apply = applyMenuTheme
+SESSION.Menu = MENU
+
+----------------------------------------------------------------------
+-- 9e. RAINBOW
+----------------------------------------------------------------------
+-- One engine driving whichever colours you tick, rather than a rainbow toggle
+-- bolted onto each of the nineteen pickers. Each target gets its own hue offset
+-- so they sweep as a gradient instead of the whole screen pulsing one colour.
+--
+-- Targets are keyed to the flag that normally owns them, so switching rainbow
+-- off can put the picked colour straight back rather than leaving whatever hue
+-- it happened to stop on.
+local RAINBOW = {
+	enabled = false,
+	speed   = 0.25,     -- full hue cycles per second
+	sat     = 0.85,
+	val     = 1.00,
+	spread  = 0.10,     -- hue gap between successive targets
+	targets = {},
+	t       = 0,
+	lastMenu = 0,
+}
+
+local RAINBOW_TARGETS = {
+	{ key = "Info background", flag = "cust_bg",       set = function(c) INFO.bg = c end },
+	{ key = "Info heading",    flag = "cust_head",     set = function(c) INFO.heading = c end },
+	{ key = "Info labels",     flag = "cust_key",      set = function(c) INFO.key = c end },
+	{ key = "Info values",     flag = "cust_val",      set = function(c) INFO.value = c end },
+	{ key = "Info border",     flag = "cust_border",   set = function(c) INFO.border = c end },
+	{ key = "Info title",      flag = "cust_title",    set = function(c) INFO.titleCol = c end },
+	{ key = "Mob ESP",         flag = "cust_mobesp",   set = function(c) ESP.colour = c end },
+	{ key = "Chest ESP",       flag = "cust_chest",    set = function(c) WORLD.chestColour = c end },
+	{ key = "Loot ESP",        flag = "cust_loot",     set = function(c) WORLD.lootColour = c end },
+	{ key = "Quest markers",   flag = "cust_quest",    set = function(c) QUEST.colour = c end },
+	{ key = "Aura ring",       flag = "cust_ringkill", set = function(c) RING.killColour = c end },
+	{ key = "Mining ring",     flag = "cust_ringmine", set = function(c) RING.mineColour = c end },
+	{ key = "Zone ring",       flag = "cust_ringzone", set = function(c) ZONE.colour = c end },
+	{ key = "Place names",     flag = "cust_places",   set = function(c) PLACES.colour = c end },
+	-- menu roles: these need the GUI repainted, which is the expensive one
+	{ key = "Menu accent",     flag = "menu_accent", menu = true, set = function(c) MENU.accent = c end },
+	{ key = "Menu panels",     flag = "menu_panel",  menu = true, set = function(c) MENU.panel = c end },
+	{ key = "Menu window",     flag = "menu_bg",     menu = true, set = function(c) MENU.windowBg = c end },
+	{ key = "Menu inputs",     flag = "menu_input",  menu = true, set = function(c) MENU.input = c end },
+	{ key = "Menu text",       flag = "menu_text",   menu = true, set = function(c) MENU.text = c end },
+	{ key = "Menu dim text",   flag = "menu_dim",    menu = true, set = function(c) MENU.dim = c end },
+}
+RAINBOW.list = RAINBOW_TARGETS
+
+-- Put a target back to whatever its picker says.
+local function restoreTarget(tgt)
+	pcall(function()
+		local f = NeverLose.Flags[tgt.flag]
+		local v = f and f:GetValue()
+		if typeof(v) == "Color3" then tgt.set(v) end
+	end)
+end
+RAINBOW.restore = restoreTarget
+
+loop(0.05, function()
+	if not SESSION.Alive then return end
+	if not RAINBOW.enabled then return end
+
+	RAINBOW.t = (RAINBOW.t + 0.05 * RAINBOW.speed) % 1
+	local i, menuTouched = 0, false
+	for _, tgt in ipairs(RAINBOW_TARGETS) do
+		if RAINBOW.targets[tgt.key] then
+			i = i + 1
+			local hue = (RAINBOW.t + (i - 1) * RAINBOW.spread) % 1
+			tgt.set(Color3.fromHSV(hue, RAINBOW.sat, RAINBOW.val))
+			if tgt.menu then menuTouched = true end
+		end
+	end
+
+	-- Repainting the menu means walking several hundred instances. At 20Hz that
+	-- is thousands of property writes a second for a cosmetic, so the menu side
+	-- runs at 10Hz while the world colours keep the full rate.
+	if menuTouched and os.clock() - RAINBOW.lastMenu >= 0.1 then
+		RAINBOW.lastMenu = os.clock()
+		MENU.apply()
+	end
+end)
+
+SESSION.Rainbow = RAINBOW
+
 -- Labels the HUD refresh writes to live on this table. Everything the UI builds
 -- otherwise is scoped to the do...end below: Luau allows only 200 locals in one
 -- scope and the menu outgrew it, which is a COMPILE error - the script simply
@@ -3462,18 +5080,24 @@ do
 -- 10. UI
 ----------------------------------------------------------------------
 -- Neverlose is label-first: Section -> Label -> Control.
-local tabCombat = window:AddTab({ Icon = "crosshairs",        Name = "Combat"   })
-local tabMobs   = window:AddTab({ Icon = "person-simple-run", Name = "Mobs"     })
-local tabMine   = window:AddTab({ Icon = "pickaxe",           Name = "Mining"   })
-local tabEsp    = window:AddTab({ Icon = "eye",               Name = "ESP"      })
-local tabVisual = window:AddTab({ Icon = "cube-vertexes",     Name = "Visuals"  })
-local tabMove   = window:AddTab({ Icon = "mouse-scrollwheel", Name = "Movement" })
-local tabPvp    = window:AddTab({ Icon = "crosshairs-slash",  Name = "PvP"      })
-local tabMisc   = window:AddTab({ Icon = "crop",              Name = "Misc"     })
+local TABS = {}
+TABS.tabCombat = window:AddTab({ Icon = "crosshairs",        Name = "Combat"   })
+TABS.tabMobs   = window:AddTab({ Icon = "person-simple-run", Name = "Mobs"     })
+TABS.tabMine   = window:AddTab({ Icon = "pickaxe",           Name = "Mining"   })
+TABS.tabEsp    = window:AddTab({ Icon = "eye",               Name = "ESP"      })
+TABS.tabInfo   = window:AddTab({ Icon = "book-open",         Name = "Info"     })
+TABS.tabCust   = window:AddTab({ Icon = "paint-brush",       Name = "Customize"})
+TABS.tabVisual = window:AddTab({ Icon = "cube-vertexes",     Name = "Visuals"  })
+TABS.tabMove   = window:AddTab({ Icon = "mouse-scrollwheel", Name = "Movement" })
+TABS.tabPvp    = window:AddTab({ Icon = "crosshairs-slash",  Name = "PvP"      })
+TABS.tabMisc   = window:AddTab({ Icon = "crop",              Name = "Misc"     })
 
 -- ---------- Combat ----------
-local secAura = tabCombat:AddSection({ Name = "AURA" })
-local secInfo = tabCombat:AddSection({ Name = "STATUS", Position = "right" })
+local secAura = TABS.tabCombat:AddSection({ Name = "AURA" })
+local secInfo = TABS.tabCombat:AddSection({ Name = "STATUS", Position = "right" })
+-- AURA controls block-scoped: Luau allows 200 locals per function and
+-- the UI builder keeps outgrowing it. Closing a block hands its back.
+do
 
 local lblAura = secAura:AddLabel("Hit Aura")
 lblAura:ToolTip(
@@ -3501,10 +5125,15 @@ lblAura:AddToggle({
 
 local lblHitAll = secAura:AddLabel("Hit everything in range")
 lblHitAll:ToolTip(
-	"Anything standing inside the circle gets swung at, up to the server's own\n" ..
-	"MAX_TARGETS of 6 per swing, and keeps getting swung at until it dies.\n\n" ..
-	"With this OFF the aura only hits what the farm filters allow — so a mob\n" ..
-	"above your level gap could stand on you and never be hit back."
+	"ON means EVERYTHING: every live mob in the circle, up to the server's own\n" ..
+	"MAX_TARGETS of 6 per swing, ignoring the Mobs tab's name filter AND the\n" ..
+	"Survival vetoes (miniboss, corrupted, over-level).\n\n" ..
+	"It used to still obey the name filter, which is how a filter left on one mob\n" ..
+	"kind made the aura quietly ignore fourteen Evil Snowmen standing on top of\n" ..
+	"you. Those filters decide what you WALK TO; they have no business deciding\n" ..
+	"what you hit back.\n\n" ..
+	"OFF applies both, so the aura only hits what the farm would have chosen —\n" ..
+	"and a mob above your level gap can then stand on you and never be hit."
 )
 lblHitAll:AddToggle({
 	Default = true, Flag = "aura_hitall",
@@ -3623,13 +5252,14 @@ secAura:AddLabel("Manual swing"):AddToggle({
 		end)
 	end,
 })
+end
 
 -- ---------- Farm ----------
 -- ---------- Mobs ----------
 -- The farm and its mob filter live here rather than in Combat. They are the
 -- same controls on the same state, not copies: two controls writing one field
 -- means whichever you touched last silently wins.
-local secFarm = tabMobs:AddSection({ Name = "AUTO FARM" })
+local secFarm = TABS.tabMobs:AddSection({ Name = "AUTO FARM" })
 
 local lblFarm = secFarm:AddLabel("Auto-seek targets")
 lblFarm:ToolTip(
@@ -3754,6 +5384,15 @@ loop(5, function()
 			if knownTypes[label] == nil then changed = true end
 		end
 	end
+	-- also react when a type STOPS being present. Only checking for new labels
+	-- meant the list could grow but never shrink, so every mob you had ever
+	-- walked past stayed in the filter for the rest of the session -- including
+	-- ones from a floor you had long since left.
+	if not changed then
+		for label in pairs(knownTypes) do
+			if seen[label] == nil then changed = true break end
+		end
+	end
 	if not changed then return end
 	knownTypes = seen
 	labelToName = seen
@@ -3768,7 +5407,7 @@ end)
 -- block hands its registers back. Without this, adding this section pushed the
 -- UI builder over the limit and the whole script stopped compiling.
 do
-local secZone = tabMobs:AddSection({ Name = "FARM ZONE", Position = "right" })
+local secZone = TABS.tabMobs:AddSection({ Name = "FARM ZONE", Position = "right" })
 
 local lblZonePlace = secZone:AddLabel("Zone")
 lblZonePlace:ToolTip(
@@ -3877,8 +5516,11 @@ UI.lblNear = secInfo:AddLabel("Nearest: —")
 UI.lblHp = secInfo:AddLabel("HP: —")
 UI.lblZone = secInfo:AddLabel("Zone: —   Potions: —")
 
+-- Survival and Defense block-scoped: 200 locals per function, and closing
+-- a block hands its registers back for the sections that follow.
+do
 -- ---------- Survival ----------
-local secSurv = tabCombat:AddSection({ Name = "SURVIVAL", Position = "right" })
+local secSurv = TABS.tabCombat:AddSection({ Name = "SURVIVAL", Position = "right" })
 
 local lblGuard = secSurv:AddLabel("Health guard")
 lblGuard:ToolTip(
@@ -3986,7 +5628,7 @@ UI.lblRespawnStat = secSurv:AddLabel("Respawns: 0")
 end
 
 -- ---------- Defense ----------
-local secDef = tabCombat:AddSection({ Name = "DEFENSE", Position = "right" })
+local secDef = TABS.tabCombat:AddSection({ Name = "DEFENSE", Position = "right" })
 
 local function ensureHook(who)
 	local okH, err = hookTelegraphs()
@@ -4047,7 +5689,14 @@ lblParry:ToolTip(
 	"Combat:FireServer(\"Parry\", GetServerTimeNow()), read out of\n" ..
 	"Client.Systems.Combat line 1053.\n\n" ..
 	"Timed off the telegraph's wind-up so it lands inside the 0.4s parry window\n" ..
-	"rather than on the wind-up starting. Respects the game's own 1.5s cooldown.\n\n" ..
+	"rather than on the wind-up starting.\n\n" ..
+	"THE COOLDOWN CANNOT BE REMOVED, and it is worth knowing why. The client\n" ..
+	"gates itself in a local upvalue that we bypass entirely, so spamming the\n" ..
+	"remote looks like it should work. MEASURED: 70 parries fired at 0.1s over\n" ..
+	"7 seconds produced EIGHT, spaced 0.93s. The server drops the rest.\n\n" ..
+	"What WAS wrong: this used to wait 1.5s, a number guessed from a misreading\n" ..
+	"of the config. The real value is 0.9, so it now parries about half again as\n" ..
+	"often as it used to. Use Hold guard below to cover the gap.\n\n" ..
 	"Takes priority over Dodge AoE — a parry costs no ground and staggers the mob.\n" ..
 	"Dodge is the fallback while parry is on cooldown or the attacker is out of reach."
 )
@@ -4067,6 +5716,42 @@ parryOpt:AddLabel("Lead time"):AddSlider({
 parryOpt:AddLabel("Max reach"):AddSlider({
 	Min = 5, Max = 40, Default = 16, Rounding = 0, Type = " studs", Size = 110,
 	Flag = "def_parryrange", Callback = function(v) DEF.parryRange = v end,
+})
+
+local lblDefGuard = secDef:AddLabel("Hold guard between parries")
+lblDefGuard:ToolTip(
+	"THE ANSWER TO BEING SURROUNDED. The parry cooldown is the server's and\n" ..
+	"cannot be shortened, so instead of standing in that 0.9s unprotected, this\n" ..
+	"holds Block whenever a mob is within reach.\n\n" ..
+	"MEASURED in PvP: three light swings cost 42 damage unguarded and 4 while\n" ..
+	"blocking — about 90%, applied server-side. It costs roughly 0.75 stamina a\n" ..
+	"second out of your pool and is refunded the moment it drops.\n\n" ..
+	"THE TRADE: you cannot swing while guard is up, so your aura stands down\n" ..
+	"while mobs are close. Use it when you are being swarmed, not while farming.\n\n" ..
+	"Needs a weapon drawn — the server refuses Block with an empty hand, and the\n" ..
+	"status line says so rather than looking idle."
+)
+lblDefGuard:AddToggle({
+	Default = false, Flag = "def_guard",
+	Callback = function(v)
+		DEF.guard = v
+		if not v and DEF.setGuard then pcall(function() DEF.setGuard(false) end) end
+	end,
+})
+local guardOpt = lblDefGuard:AddOption()
+local lblGuardWindow = guardOpt:AddLabel("Drop guard to swing for")
+lblGuardWindow:ToolTip(
+	"Guard and swinging cannot both happen: the server discards a swing sent\n" ..
+	"while you are Blocking. With both features on that gave 'stamina 5 —\n" ..
+	"waiting' and no attacks at all — they cancelled each other out.\n\n" ..
+	"So the aura now lowers the guard for this long, lands its swing, and the\n" ..
+	"guard goes straight back up. Longer means more damage dealt and more taken;\n" ..
+	"shorter means the reverse. 0 keeps the old behaviour of never lowering it."
+)
+lblGuardWindow:AddSlider({
+	Min = 0, Max = 150, Default = 45, Rounding = 0, Type = " cs", Size = 120,
+	Flag = "def_guardwindow",
+	Callback = function(v) SESSION.DefGuard.window = v / 100 end,
 })
 
 local lblHeavy = secDef:AddLabel("Dodge heavy hits")
@@ -4126,6 +5811,7 @@ lblTest:AddToggle({
 })
 
 UI.lblDefStat = secDef:AddLabel("Telegraphs 0 / dodged 0")
+end
 
 -- ---------- ESP ----------
 -- block-scoped for registers; see the note at the farm zone
@@ -4133,8 +5819,8 @@ do
 -- Everything that draws something over the world lives on this one tab: mobs,
 -- players, chests and loot. They were spread across Visuals and PvP before.
 do
-local secEspMob   = tabEsp:AddSection({ Name = "CREATURES" })
-local secEspWorld = tabEsp:AddSection({ Name = "CHESTS & LOOT", Position = "right" })
+local secEspMob   = TABS.tabEsp:AddSection({ Name = "CREATURES" })
+local secEspWorld = TABS.tabEsp:AddSection({ Name = "CHESTS & LOOT", Position = "right" })
 
 local lblEsp = secEspMob:AddLabel("Mob ESP")
 lblEsp:ToolTip("Highlights live mobs. Pool capped at 28 — Roblox stops drawing past ~31.")
@@ -4204,13 +5890,408 @@ secEspWorld:AddLabel("Label range"):AddSlider({
 	Flag = "esp_worldrange", Callback = function(v) WORLD.range = v end,
 })
 UI.lblWorldEsp = secEspWorld:AddLabel("Labels: off")
+
+local lblPlaces = secEspWorld:AddLabel("Place names")
+lblPlaces:ToolTip(
+	"Floats the map's own place names over the world.\n\n" ..
+	"None of these names are invented — they are read from what the game calls\n" ..
+	"things. workspace.MapAnchors holds the towns (Skalvik, Frosthaven,\n" ..
+	"Eirholm), and the floor folder holds MobZones, MinibossArenas,\n" ..
+	"FishingSpots and Lookouts.\n\n" ..
+	"The mob zones are the useful ones: their names encode the area, the mob\n" ..
+	"AND the level range — EasternDrifts_SnowApe_Lv27-28 tells you exactly\n" ..
+	"where to go for a Snow Ape quest. They are tidied up for display.\n\n" ..
+	"It looks for whichever FloorN folder exists, so it is not pinned to Floor 2."
+)
+lblPlaces:AddToggle({
+	Default = false, Flag = "places_on",
+	Callback = function(v)
+		PLACES.enabled = v
+		PLACES.lastScan = 0      -- rescan on the next tick
+	end,
+})
+-- One switch per category, so the mob-zone clutter can go without taking the
+-- towns with it. Each is its own flag, so the choice survives a config load.
+local placeOpt = lblPlaces:AddOption()
+for _, cat in ipairs({
+	{ "Towns",     "places_towns",   true,  "Frosthaven, Skalvik, Eirholm. Landmarks: these float high." },
+	{ "Bosses",    "places_bosses",  true,  "Dungeon, Boss Room and the four miniboss arenas. Also high." },
+	{ "Mob zones", "places_mobs",    false, "The hunting grounds, with the mob and level range in the name." },
+	{ "Fishing",   "places_fishing", false, "Fishing spots. Detail, so these sit low." },
+	{ "Lookouts",  "places_lookout", false, "West, East and North lookouts. Detail." },
+}) do
+	local lbl = placeOpt:AddLabel(cat[1])
+	lbl:ToolTip(cat[4])
+	lbl:AddToggle({
+		Default = cat[3], Flag = cat[2],
+		Callback = function(v) PLACES.cats[cat[1]] = v or nil end,
+	})
 end
 
+placeOpt:AddLabel("Range"):AddSlider({
+	Min = 200, Max = 12000, Default = 6000, Rounding = 0, Type = " studs", Size = 120,
+	Flag = "places_range", Callback = function(v) PLACES.range = v end,
+})
+placeOpt:AddLabel("Landmark height"):AddSlider({
+	Min = 10, Max = 200, Default = 70, Rounding = 0, Type = " studs", Size = 120,
+	Flag = "places_hmaj", Callback = function(v) PLACES.majorHeight = v end,
+})
+placeOpt:AddLabel("Detail height"):AddSlider({
+	Min = 2, Max = 120, Default = 18, Rounding = 0, Type = " studs", Size = 120,
+	Flag = "places_hmin", Callback = function(v) PLACES.minorHeight = v end,
+})
+placeOpt:AddLabel("Landmark text"):AddSlider({
+	Min = 10, Max = 36, Default = 20, Rounding = 0, Type = " px", Size = 120,
+	Flag = "places_smaj", Callback = function(v) PLACES.majorSize = v end,
+})
+placeOpt:AddLabel("Detail text"):AddSlider({
+	Min = 8, Max = 24, Default = 13, Rounding = 0, Type = " px", Size = 120,
+	Flag = "places_smin", Callback = function(v) PLACES.minorSize = v end,
+})
+UI.lblPlaces = secEspWorld:AddLabel("Places: off")
+end
+
+end
+
+-- ---------- Info ----------
+do
+local secQuest = TABS.tabInfo:AddSection({ Name = "QUEST" })
+local secBox   = TABS.tabInfo:AddSection({ Name = "INFO BOX", Position = "right" })
+
+local lblQEsp = secQuest:AddLabel("Quest ESP")
+lblQEsp:ToolTip(
+	"Tags every mob your current objective wants, with its distance.\n\n" ..
+	"HOW IT HAS TO WORK: the quest definitions are server-side — grepping all\n" ..
+	"483 client scripts for a real quest id finds nothing. The client is handed\n" ..
+	"only { text = \"Defeat Evil Snowman\", have = 3, need = 15 }, with no mob\n" ..
+	"reference and no coordinate in it.\n\n" ..
+	"So the target is recovered from that sentence by matching its words against\n" ..
+	"what is actually spawned, comparing letters only — \"Evil Snowman\" finds\n" ..
+	"EvilSnowman, and the longest match wins so \"Ice Wasp\" beats \"Wasp\".\n\n" ..
+	"It only works for KILL objectives. \"Travel to Floor 2\" has no position\n" ..
+	"anywhere on the client, and the status below says so rather than guessing."
+)
+lblQEsp:AddToggle({
+	Default = false, Flag = "quest_esp",
+	Callback = function(v) QUEST.esp = v end,
+})
+
+local lblQTrail = secQuest:AddLabel("Quest trail")
+lblQTrail:ToolTip(
+	"Lays markers along the route to the nearest mob your quest wants.\n\n" ..
+	"It is a real PathfindingService route, the same one the walker would take,\n" ..
+	"not a straight line — a straight line through a mountain is worse than no\n" ..
+	"trail at all. Recomputed every 3 seconds as you move.\n\n" ..
+	"Same limit as the ESP: kill objectives only."
+)
+lblQTrail:AddToggle({
+	Default = false, Flag = "quest_trail",
+	Callback = function(v)
+		QUEST.trail = v
+		QUEST.lastPath = 0
+	end,
+})
+secQuest:AddLabel("Marker colour"):AddColorPicker({
+	Default = Color3.fromRGB(255, 225, 120), Flag = "quest_colour",
+	Callback = function(c) QUEST.colour = c end,
+})
+UI.lblQuestStat = secQuest:AddLabel("Quest: —")
+
+local lblInfoPick = secBox:AddLabel("Show in the box")
+lblInfoPick:ToolTip(
+	"Tick what the box should display. Everything is read live each tick, so\n" ..
+	"nothing in it can go stale.\n\n" ..
+	"Sword and Armor come from your character's own attributes (WeaponDamage,\n" ..
+	"ArmorHealth, Defense), so they are the game's numbers, not a guess."
+)
+lblInfoPick:AddDropdown({
+	Default = {}, Multi = true,
+	Values = { "Sword", "Armor", "Status", "Combat stats", "Quest", "Position", "Mining" },
+	Flag = "info_fields",
+	Callback = function(v)
+		local set = {}
+		if type(v) == "table" then
+			for a, b in pairs(v) do
+				if b == true then set[a] = true
+				elseif type(b) == "string" then set[b] = true end
+			end
+		end
+		INFO.fields = set
+	end,
+})
+
+local lblInfoOn = secBox:AddLabel("Show info box")
+lblInfoOn:ToolTip(
+	"The box lives in its OWN ScreenGui, not inside the menu — so closing the\n" ..
+	"menu leaves it on screen, which is the whole point of it. It also survives\n" ..
+	"dying, because ResetOnSpawn is off.\n\n" ..
+	"Drag it by the title strip along its top."
+)
+lblInfoOn:AddToggle({
+	Default = false, Flag = "info_on",
+	Callback = function(v) INFO.enabled = v end,
+})
+
+local infoOpt = lblInfoOn:AddOption()
+infoOpt:AddLabel("Width"):AddSlider({
+	Min = 140, Max = 520, Default = 230, Rounding = 0, Type = " px", Size = 120,
+	Flag = "info_w", Callback = function(v) INFO.width = v end,
+})
+infoOpt:AddLabel("Height"):AddSlider({
+	Min = 80, Max = 600, Default = 150, Rounding = 0, Type = " px", Size = 120,
+	Flag = "info_h", Callback = function(v) INFO.height = v end,
+})
+infoOpt:AddLabel("Text size"):AddSlider({
+	Min = 9, Max = 24, Default = 14, Rounding = 0, Type = " px", Size = 120,
+	Flag = "info_text", Callback = function(v) INFO.textSize = v end,
+})
+end
+
+-- ---------- Customize ----------
+-- Every colour the script draws, gathered in one place. The pickers here are
+-- the SAME flags as the ones on their own tabs, not copies: two controls
+-- writing one field means whichever you touched last silently wins, and that
+-- bug is miserable to find.
+do
+local secBox  = TABS.tabCust:AddSection({ Name = "INFO BOX" })
+local secWorld = TABS.tabCust:AddSection({ Name = "WORLD COLOURS", Position = "right" })
+
+secBox:AddLabel("Background"):AddColorPicker({
+	Default = Color3.fromRGB(16, 17, 22), Flag = "cust_bg",
+	Callback = function(c) INFO.bg = c end,
+})
+secBox:AddLabel("Heading"):AddColorPicker({
+	Default = Color3.fromRGB(120, 170, 255), Flag = "cust_head",
+	Callback = function(c) INFO.heading = c end,
+})
+secBox:AddLabel("Label"):AddColorPicker({
+	Default = Color3.fromRGB(150, 156, 178), Flag = "cust_key",
+	Callback = function(c) INFO.key = c end,
+})
+secBox:AddLabel("Value"):AddColorPicker({
+	Default = Color3.fromRGB(240, 243, 252), Flag = "cust_val",
+	Callback = function(c) INFO.value = c end,
+})
+secBox:AddLabel("Border"):AddColorPicker({
+	Default = Color3.fromRGB(62, 66, 84), Flag = "cust_border",
+	Callback = function(c) INFO.border = c end,
+})
+secBox:AddLabel("Title text"):AddColorPicker({
+	Default = Color3.fromRGB(235, 238, 248), Flag = "cust_title",
+	Callback = function(c) INFO.titleCol = c end,
+})
+secBox:AddLabel("Transparency"):AddSlider({
+	Min = 0, Max = 100, Default = 8, Rounding = 0, Type = "%", Size = 120,
+	Flag = "cust_alpha", Callback = function(v) INFO.bgAlpha = v / 100 end,
+})
+secBox:AddLabel("Corner radius"):AddSlider({
+	Min = 0, Max = 24, Default = 10, Rounding = 0, Type = " px", Size = 120,
+	Flag = "cust_corner", Callback = function(v) INFO.corner = v end,
+})
+secBox:AddLabel("Show title bar"):AddToggle({
+	Default = true, Flag = "cust_showtitle",
+	Callback = function(v) INFO.showTitle = v end,
+})
+secBox:AddLabel("Show border"):AddToggle({
+	Default = true, Flag = "cust_showborder",
+	Callback = function(v) INFO.showBorder = v end,
+})
+secBox:AddLabel("Title"):AddTextInput({
+	Default = "Project Eternity", Placeholder = "Box title",
+	Flag = "cust_titletext", Size = 130,
+	Callback = function(v) INFO.title = tostring(v) end,
+})
+
+-- World visuals, all of them, in one place
+secWorld:AddLabel("Mob ESP"):AddColorPicker({
+	Default = Color3.fromRGB(78, 127, 252), Flag = "cust_mobesp",
+	Callback = function(c) ESP.colour = c end,
+})
+secWorld:AddLabel("Chest ESP"):AddColorPicker({
+	Default = Color3.fromRGB(255, 200, 90), Flag = "cust_chest",
+	Callback = function(c) WORLD.chestColour = c end,
+})
+secWorld:AddLabel("Loot ESP"):AddColorPicker({
+	Default = Color3.fromRGB(120, 220, 255), Flag = "cust_loot",
+	Callback = function(c) WORLD.lootColour = c end,
+})
+secWorld:AddLabel("Quest markers"):AddColorPicker({
+	Default = Color3.fromRGB(255, 225, 120), Flag = "cust_quest",
+	Callback = function(c) QUEST.colour = c end,
+})
+secWorld:AddLabel("Aura ring"):AddColorPicker({
+	Default = Color3.fromRGB(255, 110, 110), Flag = "cust_ringkill",
+	Callback = function(c) RING.killColour = c end,
+})
+secWorld:AddLabel("Mining ring"):AddColorPicker({
+	Default = Color3.fromRGB(120, 220, 255), Flag = "cust_ringmine",
+	Callback = function(c) RING.mineColour = c end,
+})
+secWorld:AddLabel("Farm zone ring"):AddColorPicker({
+	Default = Color3.fromRGB(140, 255, 160), Flag = "cust_ringzone",
+	Callback = function(c) ZONE.colour = c end,
+})
+secWorld:AddLabel("Place names"):AddColorPicker({
+	Default = Color3.fromRGB(255, 255, 255), Flag = "cust_places",
+	Callback = function(c) PLACES.colour = c end,
+})
+
+end
+
+-- ---------- Customize: the menu itself ----------
+do
+local secMenuTheme = TABS.tabCust:AddSection({ Name = "THE MENU" })
+
+local lblTheme = secMenuTheme:AddLabel("Menu colours")
+lblTheme:ToolTip(
+	"Recolours the menu itself through Raven's theme API, so a change lands on\n" ..
+	"everything already on screen — there is no instance-walking repaint here\n" ..
+	"any more.\n\n" ..
+	"Raven carries 24 theme tokens. These six are the roles worth deciding; the\n" ..
+	"rest are derived from them, so the depth order (sidebar darker than window,\n" ..
+	"window darker than card, card darker than control) holds whatever you pick.\n" ..
+	"The accent's own text colour is chosen for you from its brightness, which is\n" ..
+	"what stops a pale accent from printing white-on-white."
+)
+
+-- One table so the pickers' defaults and the reset button cannot drift apart.
+-- These are Raven's own defaults, so the menu starts as its author drew it.
+local MENU_DEFAULTS = {
+	menu_bg     = { role = "windowBg", col = Color3.fromRGB(26, 26, 26) },
+	menu_panel  = { role = "panel",    col = Color3.fromRGB(30, 30, 30) },
+	menu_input  = { role = "input",    col = Color3.fromRGB(22, 22, 22) },
+	menu_accent = { role = "accent",   col = Color3.fromRGB(226, 226, 226) },
+	menu_text   = { role = "text",     col = Color3.fromRGB(236, 236, 236) },
+	menu_dim    = { role = "dim",      col = Color3.fromRGB(142, 142, 142) },
+}
+
+local function themePicker(label, flag)
+	local role = MENU_DEFAULTS[flag].role
+	secMenuTheme:AddLabel(label):AddColorPicker({
+		Default = MENU_DEFAULTS[flag].col, Flag = flag,
+		Callback = function(c) MENU[role] = c MENU.apply() end,
+	})
+end
+
+themePicker("Window background", "menu_bg")
+themePicker("Panels & borders",  "menu_panel")
+themePicker("Inputs",            "menu_input")
+themePicker("Accent",            "menu_accent")
+themePicker("Text",              "menu_text")
+themePicker("Dim text",          "menu_dim")
+
+secMenuTheme:AddButton({
+	Icon = "arrow-rotate-left",
+	Name = "Reset menu colours",
+	Callback = function()
+		for _, d in pairs(MENU_DEFAULTS) do MENU[d.role] = d.col end
+		for flag, col in pairs({
+			menu_bg = MENU.windowBg, menu_panel = MENU.panel, menu_input = MENU.input,
+			menu_accent = MENU.accent, menu_text = MENU.text, menu_dim = MENU.dim,
+		}) do
+			pcall(function() NeverLose.Flags[flag]:SetValue(col) end)
+		end
+		MENU.apply()
+		Logging.new("paint-brush", "Menu colours reset", 4)
+	end,
+})
+
+secMenuTheme:AddLabel("Menu size"):AddDropdown({
+	Values = { "Default", "Small", "Large" }, Default = "Default",
+	Flag = "menu_scale",
+	Callback = function(v)
+		pcall(function() window:SetSize(NeverLose.Scales[v] or NeverLose.Scales.Default) end)
+	end,
+})
+end
+
+-- ---------- Customize: rainbow ----------
+do
+local secRb = TABS.tabCust:AddSection({ Name = "RAINBOW", Position = "right" })
+
+local lblRb = secRb:AddLabel("Rainbow")
+lblRb:ToolTip(
+	"Cycles the hue of whichever colours you tick below.\n\n" ..
+	"One engine drives all of them rather than a separate toggle on each of the\n" ..
+	"nineteen pickers, and each target gets its own hue offset so they sweep as\n" ..
+	"a gradient instead of the whole screen pulsing one colour. The Spread\n" ..
+	"slider sets that offset — 0 makes everything move in lockstep.\n\n" ..
+	"Turning a target off puts its picker's colour straight back, rather than\n" ..
+	"leaving it on whatever hue the cycle happened to stop at.\n\n" ..
+	"The menu roles are the costly ones: recolouring the menu means walking\n" ..
+	"several hundred instances, so those repaint at 10Hz while the world\n" ..
+	"colours run at the full 20."
+)
+lblRb:AddToggle({
+	Default = false, Flag = "rb_on",
+	Callback = function(v)
+		RAINBOW.enabled = v
+		if not v then
+			for _, t in ipairs(RAINBOW.list) do RAINBOW.restore(t) end
+			pcall(MENU.apply)
+		end
+	end,
+})
+
+local rbNames = {}
+for _, t in ipairs(RAINBOW.list) do rbNames[#rbNames + 1] = t.key end
+
+secRb:AddLabel("What cycles"):AddDropdown({
+	Default = {}, Multi = true, Values = rbNames, Flag = "rb_targets",
+	Callback = function(v)
+		local set = {}
+		if type(v) == "table" then
+			for a, b in pairs(v) do
+				if b == true then set[a] = true
+				elseif type(b) == "string" then set[b] = true end
+			end
+		end
+		-- anything just unticked goes back to its picked colour
+		for _, t in ipairs(RAINBOW.list) do
+			if RAINBOW.targets[t.key] and not set[t.key] then RAINBOW.restore(t) end
+		end
+		RAINBOW.targets = set
+		pcall(MENU.apply)
+	end,
+})
+
+local rbOpt = lblRb:AddOption()
+rbOpt:AddLabel("Speed"):AddSlider({
+	Min = 1, Max = 200, Default = 25, Rounding = 0, Type = "%", Size = 120,
+	Flag = "rb_speed", Callback = function(v) RAINBOW.speed = v / 100 end,
+})
+rbOpt:AddLabel("Spread"):AddSlider({
+	Min = 0, Max = 50, Default = 10, Rounding = 0, Type = "%", Size = 120,
+	Flag = "rb_spread", Callback = function(v) RAINBOW.spread = v / 100 end,
+})
+rbOpt:AddLabel("Saturation"):AddSlider({
+	Min = 0, Max = 100, Default = 85, Rounding = 0, Type = "%", Size = 120,
+	Flag = "rb_sat", Callback = function(v) RAINBOW.sat = v / 100 end,
+})
+rbOpt:AddLabel("Brightness"):AddSlider({
+	Min = 10, Max = 100, Default = 100, Rounding = 0, Type = "%", Size = 120,
+	Flag = "rb_val", Callback = function(v) RAINBOW.val = v / 100 end,
+})
+
+secRb:AddButton({
+	Icon = "check-all",
+	Name = "Rainbow everything",
+	Callback = function()
+		local all = {}
+		for _, t in ipairs(RAINBOW.list) do all[t.key] = true end
+		RAINBOW.targets = all
+		pcall(function() NeverLose.Flags.rb_targets:SetValue(all) end)
+		pcall(function() NeverLose.Flags.rb_on:SetValue(true) end)
+		RAINBOW.enabled = true
+		Logging.new("paint-brush", "Rainbow on everything", 4)
+	end,
+})
+UI.lblRainbow = secRb:AddLabel("Rainbow: off")
 end
 
 -- ---------- Visuals ----------
 do
-local secLig = tabVisual:AddSection({ Name = "LIGHTING", Position = "right" })
+local secLig = TABS.tabVisual:AddSection({ Name = "LIGHTING", Position = "right" })
 
 local lblFov = secLig:AddLabel("FOV changer")
 lblFov:ToolTip("Sets Camera.FieldOfView and keeps it there. Default in this game is 80. Restored on unload.")
@@ -4300,8 +6381,8 @@ end
 -- ---------- Movement ----------
 -- Block-scoped for the register reason explained at the farm zone.
 do
-local secMove = tabMove:AddSection({ Name = "MOVEMENT" })
-local secTp   = tabMove:AddSection({ Name = "TRAVEL", Position = "right" })
+local secMove = TABS.tabMove:AddSection({ Name = "MOVEMENT" })
+local secTp   = TABS.tabMove:AddSection({ Name = "TRAVEL", Position = "right" })
 
 local lblSpeed = secMove:AddLabel("Walk speed")
 lblSpeed:ToolTip(
@@ -4562,8 +6643,8 @@ lblStop:AddKeybind({
 end
 
 -- ---------- Misc ----------
-local secAc   = tabMisc:AddSection({ Name = "ANTI-CHEAT" })
-local secQol  = tabMisc:AddSection({ Name = "QOL", Position = "right" })
+local secAc   = TABS.tabMisc:AddSection({ Name = "ANTI-CHEAT" })
+local secQol  = TABS.tabMisc:AddSection({ Name = "QOL", Position = "right" })
 
 local lblAc = secAc:AddLabel("Neutralise Adonis")
 lblAc:ToolTip(
@@ -4600,8 +6681,8 @@ UI.lblDet = secAc:AddLabel("Detections caught: 0")
 -- ---------- PvP ----------
 -- Also block-scoped, for the register reason explained at the farm zone.
 do
-local secPvp     = tabPvp:AddSection({ Name = "TARGETING" })
-local secPvpInfo = tabPvp:AddSection({ Name = "STATUS", Position = "right" })
+local secPvp     = TABS.tabPvp:AddSection({ Name = "TARGETING" })
+local secPvpInfo = TABS.tabPvp:AddSection({ Name = "STATUS", Position = "right" })
 
 local lblPvpOn = secPvp:AddLabel("Target players")
 lblPvpOn:ToolTip(
@@ -4630,7 +6711,7 @@ pvpOpt:AddLabel("Skip friends"):AddToggle({
 -- Player ESP used to live here. It is on the ESP tab now, with the rest of it.
 
 do
-local secPvpCombat = tabPvp:AddSection({ Name = "COMBAT" })
+local secPvpCombat = TABS.tabPvp:AddSection({ Name = "COMBAT" })
 
 local lblPvpOvr = secPvpCombat:AddLabel("Use these vs players")
 lblPvpOvr:ToolTip(
@@ -4694,7 +6775,7 @@ UI.lblPvpSkillList = secPvpCombat:AddLabel("Loadout: reading…")
 end
 
 do
-local secPvpDef = tabPvp:AddSection({ Name = "DEFENCE", Position = "right" })
+local secPvpDef = TABS.tabPvp:AddSection({ Name = "DEFENCE", Position = "right" })
 
 local lblPvpParry = secPvpDef:AddLabel("Auto guard / parry")
 lblPvpParry:ToolTip(
@@ -4792,7 +6873,7 @@ end   -- PvP tab
 
 -- ---------- Mining ----------
 do
-local secMine = tabMine:AddSection({ Name = "MINING" })
+local secMine = TABS.tabMine:AddSection({ Name = "MINING" })
 
 local lblMine = secMine:AddLabel("Mining aura")
 lblMine:ToolTip(
@@ -4827,8 +6908,11 @@ lblAutoMine:ToolTip(
 	"Walks to the nearest ore node, mines it out, then walks to the next one.\n\n" ..
 	"It WALKS — the whole point of it looking legit. Nothing here writes CFrame,\n" ..
 	"so it uses the same pathfinding the farm does, round obstacles and all.\n\n" ..
-	"Needs Mining aura on above: this half does the travelling, the aura does the\n" ..
-	"hitting once a node is within reach (MiningConfig.REACH is 7.5 studs).\n\n" ..
+	"This one toggle is all you need: it walks AND swings. It used to only do the\n" ..
+	"travelling and leave the hitting to the Mining aura toggle, so switching on\n" ..
+	"just this one walked you to a node and left you standing there.\n\n" ..
+	"It draws your pickaxe, walks to the nearest node your tier can break, swings\n" ..
+	"until MinedOut, then moves to the next one.\n\n" ..
 	"A node counts as mineable while MinedOut is not set and it still has its Ore\n" ..
 	"child — the same test Client.Systems.Mining:138 makes."
 )
@@ -4909,7 +6993,7 @@ end
 
 -- ---------- Blacksmith ----------
 do
-local secSmith = tabMine:AddSection({ Name = "BLACKSMITH", Position = "right" })
+local secSmith = TABS.tabMine:AddSection({ Name = "BLACKSMITH", Position = "right" })
 
 local lblSmith = secSmith:AddLabel("Auto blacksmith")
 lblSmith:ToolTip(
@@ -4999,7 +7083,7 @@ end
 -- so rebinding is a matter of writing that field. Doing it through a flagged
 -- control means the choice survives a config load; the stock one in Settings
 -- carries no Flag and forgets itself.
-local secMenu = tabMisc:AddSection({ Name = "MENU" })
+local secMenu = TABS.tabMisc:AddSection({ Name = "MENU" })
 
 local function setMenuKey(v)
 	local name = v
@@ -5020,10 +7104,11 @@ lblMenuKey:ToolTip(
 	"Avoid X unless you want it to double as the STOP key."
 )
 lblMenuKey:AddKeybind({
-	Default   = "Insert",
+	Default   = "F4",
 	Blacklist = {},
 	Flag      = "menu_key",
-	Callback  = setMenuKey,
+	IsMenuKey = true,       -- Raven writes Library.MenuKey itself when this changes
+	OnRebind  = setMenuKey, -- we only mirror it and say so in the log
 })
 
 local lblCursor = secMenu:AddLabel("Free cursor with menu")
@@ -5087,74 +7172,40 @@ secQol:AddLabel("Copy JobId"):AddToggle({
 -- The menu key lives in Misc > MENU, where it carries a Flag and therefore
 -- survives a config load. Deliberately not duplicated here: two controls writing
 -- window.Keybind means whichever you touched last silently wins.
+-- Both of these carry a Flag now. Without one Raven auto-names the control
+-- after its section ("MENU/Dropdown"), which works on screen but means the
+-- setting is not saved or restored with a config.
+--
+-- "Mobile" was in this list with no matching entry in NeverLose.Scales, so
+-- picking it passed nil and silently did nothing. It is a real scale now.
 window.UserSettings:AddLabel("Menu Scale"):AddDropdown({
 	Default  = "Default",
-	Values   = { "Default", "Large", "Mobile", "Small" },
-	Callback = function(v) window:SetSize(NeverLose.Scales[v]) end,
+	Values   = { "Small", "Default", "Large", "Mobile" },
+	Flag     = "menu_uiscale",
+	Callback = function(v) window:SetSize(NeverLose.Scales[v] or 1) end,
 })
 window.UserSettings:AddLabel("Watermark"):AddToggle({
 	Default  = true,
+	Flag     = "menu_watermark",
 	Callback = function(v) Watermark:SetRender(v) end,
 })
 
 ----------------------------------------------------------------------
 -- 11b. HEADER TAG
 ----------------------------------------------------------------------
--- Neverlose randomises every instance name, so the search box cannot be found
--- by path. It can be found by content: the icon is a TextLabel whose Text is the
--- BuilderIcons glyph name "magnifying-glass", inside SearchFrame inside
--- RightHeader. Anchor to the right edge and sit left of the 30px search frame.
+-- This used to bolt a TextLabel onto the old library's header, found by hunting
+-- the whole GUI for its search glyph because that library randomised instance
+-- names. Raven has no such glyph, so the hunt matched nothing and the tag
+-- silently never drew -- the retry loop below just ran ten times and gave up.
+--
+-- Raven's watermark takes a Suffix, drawn beside the title in dim text. Same
+-- result, no instance-hunting, and it survives a rebuild of the menu.
 local HEADER_TEXT = brandOf("header", "zi is gay")
 
-local function addHeaderTag()
-	local gui = NeverLose.ScreenGui
-	if not gui then return false, "no ScreenGui" end
-
-	local icon
-	for _, v in ipairs(gui:GetDescendants()) do
-		if v:IsA("TextLabel") and v.Text == "magnifying-glass" then
-			icon = v
-			break
-		end
-	end
-	if not icon then return false, "search icon not found" end
-
-	local searchFrame = icon.Parent
-	local header = searchFrame and searchFrame.Parent
-	if not header then return false, "no header" end
-
-	local old = header:FindFirstChild("PE_HeaderTag")
-	if old then old:Destroy() end
-
-	local tag = Instance.new("TextLabel")
-	tag.Name = "PE_HeaderTag"
-	tag.AnchorPoint = Vector2.new(1, 0.5)
-	tag.BackgroundTransparency = 1
-	tag.Position = UDim2.new(1, -46, 0.5, 0)   -- search frame is 30 wide at -10
-	tag.Size = UDim2.new(0, 130, 0, 20)
-	tag.ZIndex = 12
-	tag.Font = Enum.Font.GothamMedium
-	tag.Text = HEADER_TEXT
-	tag.TextColor3 = Color3.fromRGB(223, 223, 223)
-	tag.TextSize = 13
-	tag.TextTransparency = 0.25
-	tag.TextXAlignment = Enum.TextXAlignment.Right
-	tag.Parent = header
-	SESSION.HeaderTag = tag
-	return true
-end
-
-task.defer(function()
-	for _ = 1, 10 do
-		if not SESSION.Alive then return end
-		local ok = addHeaderTag()
-		if ok then return end
-		task.wait(0.5)
-	end
-end)
+window:SetHeaderTag(HEADER_TEXT)
 
 table.insert(SESSION.Restore, function()
-	if SESSION.HeaderTag then pcall(function() SESSION.HeaderTag:Destroy() end) end
+	pcall(function() window:SetHeaderTag("") end)
 end)
 
 end   -- end of UI scope
@@ -5193,11 +7244,22 @@ loop(1, function()
 			sz == nil and "?" or (sz and "SAFE (regen)" or "field (no regen)"),
 			st == nil and "?" or tostring(st)))
 		UI.lblDet:SetText(("Detections caught: %d"):format(AC.detections))
-		UI.lblDefStat:SetText(("Telegraphs %d / parried %d / dodged %d")
-			:format(DEF.seen, DEF.parries, DEF.dodged))
+		do
+			local guard = "off"
+			if DEF.guard then
+				local c = character()
+				if c and c:GetAttribute("WeaponType") == nil then
+					guard = "no weapon"
+				else
+					guard = DEF.guardHeld and "UP" or "ready"
+				end
+			end
+			UI.lblDefStat:SetText(("Telegraphs %d / parried %d / dodged %d · guard %s")
+				:format(DEF.seen, DEF.parries, DEF.dodged, guard))
+		end
 		if UI.lblAutoMineStat then
-			UI.lblAutoMineStat:SetText(("Auto mine: %s · pickaxe tier %d · mined %d")
-				:format(tostring(MINE.status), MINE.myTier(), MINE.swings))
+			UI.lblAutoMineStat:SetText(("Auto mine: %s · tier %d · %d nodes, %d swings")
+				:format(tostring(MINE.status), MINE.myTier(), MINE.mined, MINE.swings))
 		end
 		if UI.lblSmithStat then
 			UI.lblSmithStat:SetText(("Forge: %s · made %d, refused %d")
@@ -5233,6 +7295,23 @@ loop(1, function()
 			local names = {}
 			for _, s in ipairs(PVP.skills) do names[#names + 1] = s.name end
 			UI.lblPvpSkillList:SetText("Loadout: " .. table.concat(names, ", "))
+		end
+		if UI.lblPlaces then
+			UI.lblPlaces:SetText(PLACES.enabled
+				and ("Places: %d shown of %d known"):format(PLACES.shown, #PLACES.cache)
+				or "Places: off")
+		end
+		if UI.lblRainbow then
+			local n = 0
+			for _ in pairs(RAINBOW.targets) do n = n + 1 end
+			UI.lblRainbow:SetText(RAINBOW.enabled
+				and ("Rainbow: %d of %d cycling"):format(n, #RAINBOW.list)
+				or "Rainbow: off")
+		end
+		if UI.lblQuestStat then
+			UI.lblQuestStat:SetText((QUEST.esp or QUEST.trail)
+				and ("Quest: " .. tostring(QUEST.note))
+				or "Quest: off")
 		end
 		if UI.lblWorldEsp then
 			if not (WORLD.chests or WORLD.loot) then
@@ -5350,6 +7429,16 @@ end
 function SESSION.Teardown()
 	cleanupAll()
 	pcall(function() NeverLose:Unload() end)
+
+	-- Unload() does not always take the ScreenGui with it. When it does not, the
+	-- next run builds a second menu and the old one is left on screen with its
+	-- tabs intact but its contents torn out — which looks exactly like the menu
+	-- deleting itself. Seen for real: two menus in gethui(), one with 449
+	-- descendants and a gutted one with 158. So destroy ours by hand.
+	pcall(function()
+		local gui = NeverLose.ScreenGui or (SESSION.Library and SESSION.Library.Gui)
+		if gui and gui.Destroy then gui:Destroy() end
+	end)
 end
 
 ----------------------------------------------------------------------

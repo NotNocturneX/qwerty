@@ -10,11 +10,42 @@
 -- 1. RE-EXECUTION GUARD
 ----------------------------------------------------------------------
 local genv = (type(getgenv) == "function") and getgenv() or nil
-if genv and genv.PE_Session and genv.PE_Session.Teardown then
-	pcall(genv.PE_Session.Teardown)
+if genv and genv.PE_Session then
+	local old = genv.PE_Session
+	if old.Teardown then pcall(old.Teardown) end
+	-- Belt and braces: if the previous run predates the ScreenGui cleanup, or
+	-- its teardown threw partway, its menu is still on screen. Destroy that
+	-- specific GUI — the one the old session recorded — rather than sweeping
+	-- gethui() blind, which would take other scripts' menus with it.
+	pcall(function()
+		local lib = old.Library
+		local gui = lib and (lib.ScreenGui or lib.Gui)
+		if gui and gui.Parent then gui:Destroy() end
+	end)
 end
 
 local SESSION = { Alive = true, Conns = {}, Restore = {}, Pool = {} }
+-- bumped by hand when verifying a reload actually replaced the running build
+SESSION.Build = "2026-11-03-b2"
+
+-- Shared handle for the mob guard. It lives here, at the top, because swingAt
+-- needs to lower the guard before it swings and swingAt is defined some 800
+-- lines BEFORE the defence section that owns it — a local declared later would
+-- be a nil global lookup from inside swingAt, which is exactly the bug that
+-- already cost a debugging session when tryJump was written below its caller.
+SESSION.DefGuard = {
+	held       = false,   -- is the block actually up
+	yieldUntil = 0,       -- keep it down until this time so a swing can land
+	window     = 0.45,    -- how long to stay down for one swing
+	raisedAt   = 0,       -- when the guard last went up
+	-- MEASURED: with No cooldown on, the aura swings about 30 times a second.
+	-- Yielding on every one of those refreshed the window continuously and the
+	-- guard never got back up at all — Blocking was up 0 of 12 samples. So the
+	-- guard has to earn a minimum spell up before a swing may lower it again,
+	-- which turns this into a duty cycle instead of the aura starving it out.
+	minUp      = 0.5,
+	setGuard   = nil,     -- filled in by the defence section
+}
 if genv then genv.PE_Session = SESSION end
 
 local Players            = game:GetService("Players")
